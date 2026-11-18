@@ -633,12 +633,12 @@ class Studio:
     def edit_one(self):
         with self.db() as db:
             db.execute("BEGIN IMMEDIATE")
-            pending = db.execute("""
+            with closing(db.execute("""
                 SELECT * FROM sources WHERE status IN ('queued','waiting_layout')
                 AND rel_file IS NOT NULL ORDER BY queued_at,id
-            """)
-            source = next((row for row in pending if row["status"] == "queued" or reaction.has_profile(
-                self.input / row["lang"] / row["rel_file"])), None)
+            """)) as pending:
+                source = next((row for row in pending if row["status"] == "queued" or reaction.has_profile(
+                    self.input / row["lang"] / row["rel_file"])), None)
             if source is None:
                 return
             db.execute("UPDATE sources SET status='editing', detail='' WHERE id=?", (source["id"],))
