@@ -1,0 +1,90 @@
+name: Verify Streamcut
+
+on:
+  pull_request:
+    types: [opened, reopened, synchronize, ready_for_review]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  workflow:
+    name: Code and media checks
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Check public commit metadata
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          python3 - <<'PY'
+          import os, subprocess, sys
+          commits = subprocess.check_output(
+              ["git", "log", "-z", "--format=%ae%x00%ce%x00%B", f"{os.environ['BASE_SHA']}..{os.environ['HEAD_SHA']}"],
+              text=True
+          ).split("\0")
+          records = [commits[i:i+3] for i in range(0, len(commits)-2, 3)]
+          if any(not (a.endswith("@users.noreply.github.com") and c.endswith("@users.noreply.github.com"))
+                 for a, c, _ in records):
+              sys.exit("Use a GitHub noreply address for public commit author and committer. Addresses are not printed.")
+          for _, _, body in records:
+              if not all(section in body for section in ("Что изменилось", "Почему", "Проверки")):
+                  sys.exit("Include «Что изменилось», «Почему», «Проверки» in each commit body.")
+          PY
+
+      - name: Prepare FFmpeg for rendering tests
+        run: |
+          if ! command -v ffmpeg >/dev/null || ! command -v ffprobe >/dev/null; then
+            if ! timeout 60s sudo apt-get install -y --no-install-recommends ffmpeg; then
+              echo '::warning::FFmpeg setup did not finish. The two FFmpeg integration tests require a local run if the binaries are missing.'
+            fi
+          fi
+
+      - name: Verify video utilities
+        id: media
+        if: always()
+        run: python3 -m unittest discover -q
+
+      - name: Verify service and discovery
+        id: service
+        if: always()
+        working-directory: control-room
+        run: python3 -m unittest discover -q
+
+      - name: Verify dashboard
+        id: dashboard
+        if: always()
+        working-directory: control-room
+        run: |
+          npm test
+          npm run check
+
+      - name: Handoff for the other reviewer
+        if: always()
+        env:
+          MEDIA: ${{ steps.media.outcome }}
+          SERVICE: ${{ steps.service.outcome }}
+          DASHBOARD: ${{ steps.dashboard.outcome }}
+        run: |
+          {
+            echo '### Streamcut review handoff'
+            echo "- CLI and captions: $MEDIA"
+            echo "- Service and discovery: $SERVICE"
+            echo "- Dashboard: $DASHBOARD"
+            if [ "$MEDIA" = success ] && [ "$SERVICE" = success ] && [ "$DASHBOARD" = success ]; then
+              echo 'Review the product behavior and edge cases in the PR diff.'
+            else
+              echo 'Open the failed step and add the reproduction and proposed fix to the PR.'
+            fi
+            echo 'See docs/CODEX_REVIEW.md for reviewer responsibilities.'
+          } >> "$GITHUB_STEP_SUMMARY"

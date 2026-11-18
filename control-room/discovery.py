@@ -5,18 +5,25 @@ from datetime import datetime, timedelta, timezone
 from html import unescape
 import os
 import re
+from unicodedata import normalize
 from urllib.parse import urlencode
 
 from transport import ConnectionProblem, json_response, request
 
-TOPIC = re.compile(r"\b(?:gta|гта|grand\s+theft\s+auto)\s*[-:]?\s*(?:vi|6)\b", re.IGNORECASE)
+NAME_SEPARATOR = r"\s._\-‐‑‒–—"
+TOPIC = re.compile(rf"(?<!\w)(?:gta|гта|grand[{NAME_SEPARATOR}]+theft[{NAME_SEPARATOR}]+auto)"
+                   rf"[{NAME_SEPARATOR}:]*(?:vi|6)(?!\w)")
+TITLE_SUFFIX = re.compile(
+    r"(?:^|\s*[|•·]\s*|\s+[-–—]\s+)"
+    r"(?:(?:tags|keywords|теги|ключевые слова|etiquetas|palabras clave)\s*:|"
+    r"(?:follow|subscribe|shoutout|подписывайтесь|подпишитесь|sígueme|suscríbete)\b|"
+    r"(?:#\w+\s*)+$)"
+)
 YOUTUBE_ID = re.compile(r"[a-zA-Z0-9_-]{11}")
 TWITCH_LOGIN = re.compile(r"[a-zA-Z0-9_]{3,25}")
 TWITCH_ID = re.compile(r"[0-9]{1,30}")
 REGION = {"RU": "RU", "EN": "US", "ESP": "ES"}
 WINDOW = timedelta(days=3)
-
-
 @dataclass(frozen=True)
 class Creator:
     label: str
@@ -33,16 +40,37 @@ WATCHLIST = {
         Creator("Бустер", "buster", ("Buster",)),
         Creator("Bratishkinoff", "bratishkinoff", ("Братишкин",)),
         Creator("Recrent", "recrent", ("Рекрент",)),
+        Creator("Evelone192", "evelone192", ("Эвелон",)),
+        Creator("Kussia88", "kussia88", ("Куся",)),
+        Creator("Stray228", "stray228", ("Стрей",)),
+        Creator("StRoGo", "strogo", ("Строго",)),
+        Creator("DreadzTV", "dreadztv", ("Дред",)),
+        Creator("Dyrachyo", "dyrachyo", ("Дурачьё",)),
+        Creator("WELOVEGAMES", "welovegames"),
     ),
     "EN": (
         Creator("Kai Cenat", "kaicenat", ("KaiCenat",)),
         Creator("CaseOh", "caseoh_", ("CaseOh_",)),
         Creator("LIRIK", "lirik"),
+        Creator("Jynxzi", "jynxzi"),
+        Creator("Tarik", "tarik"),
+        Creator("Summit1g", "summit1g"),
+        Creator("TimTheTatman", "timthetatman", ("Tim The Tatman",)),
+        Creator("NICKMERCS", "nickmercs"),
+        Creator("Ludwig", "ludwig", ("Ludwig Ahgren",)),
+        Creator("Ninja", "ninja", ("Tyler Blevins",)),
     ),
     "ESP": (
         Creator("Ibai", "ibai", ("Ibai Llanos",)),
         Creator("AuronPlay", "auronplay", ("Auron Play",)),
         Creator("IlloJuan", "illojuan", ("Illo Juan",)),
+        Creator("Rubius", "rubius", ("El Rubius",)),
+        Creator("TheGrefg", "thegrefg", ("The Grefg",)),
+        Creator("ElXokas", "elxokas", ("El Xokas",)),
+        Creator("DjMaRiiO", "djmariio", ("DJ Mario",)),
+        Creator("Cristinini", "cristinini"),
+        Creator("Alexelcapo", "alexelcapo"),
+        Creator("Knekro", "knekro"),
     ),
 }
 
@@ -67,7 +95,7 @@ def youtube_authors(lang):
         aliases = tuple(unique(alias for alias in aliases if 0 < len(alias) <= 70))[:4]
         if aliases:
             authors.append(aliases)
-    return authors[:5]
+    return authors[:12]
 
 
 def twitch_authors(lang):
@@ -75,7 +103,7 @@ def twitch_authors(lang):
     if configured is None:
         return [creator.twitch for creator in WATCHLIST.get(lang, ())]
     terms = (item.strip().lower().lstrip("@") for item in configured.split("|"))
-    return list(unique(term for term in terms if TWITCH_ID.fullmatch(term) or TWITCH_LOGIN.fullmatch(term)))[:5]
+    return list(unique(term for term in terms if TWITCH_ID.fullmatch(term) or TWITCH_LOGIN.fullmatch(term)))[:12]
 
 
 def roster():
@@ -95,6 +123,23 @@ def configured():
                 any(twitch_authors(lang) for lang in WATCHLIST))
 
 
+def matching_text(text):
+    return normalize("NFKC", text).casefold().strip()
+
+
+def subject(title):
+    return TITLE_SUFFIX.split(matching_text(title), maxsplit=1)[0]
+
+
+def creator_pattern(names):
+    alternatives = []
+    for name in names:
+        # Allow separators inside a name while preserving literal handle suffixes.
+        tokens = re.split(rf"(?<=\w)[{NAME_SEPARATOR}]+(?=[^\W_])", matching_text(name))
+        alternatives.append(rf"[{NAME_SEPARATOR}]+".join(map(re.escape, tokens)))
+    return re.compile(r"(?<!\w)(?:" + "|".join(alternatives) + r")(?!\w)")
+
+
 def youtube(lang, code):
     key = os.environ.get("STREAMCUT_YOUTUBE_KEY")
     if not key or lang not in REGION:
@@ -103,23 +148,26 @@ def youtube(lang, code):
     seen = set()
     for names in youtube_authors(lang):
         # Quota is per search call. Search spelling variants in one query per creator.
-        game_names = ("GTA 6", "GTA VI", "ГТА 6") if lang == "RU" else ("GTA 6", "GTA VI")
+        game_names = ("GTA 6", "GTA VI", "GTA6", "Grand Theft Auto VI")
+        if lang == "RU":
+            game_names += ("ГТА 6", "ГТА VI")
         terms = "|".join(f"{game} {name}" for name in names for game in game_names)
-        query = urlencode({"part": "snippet", "q": terms, "type": "video", "maxResults": 12,
+        query = urlencode({"part": "snippet", "q": terms, "type": "video", "maxResults": 25,
                            "order": "date", "regionCode": REGION[lang], "relevanceLanguage": code,
                            "publishedAfter": after})
         status, _, raw = request("server", "www.googleapis.com", "GET", f"/youtube/v3/search?{query}",
                                  {"X-Goog-Api-Key": key})
         data = json_response(status, raw, "Поиск YouTube")
-        alias = re.compile(r"(?<!\w)(?:" + "|".join(re.escape(name) for name in names) + r")(?!\w)",
-                           re.IGNORECASE)
+        alias = creator_pattern(names)
         for item in data.get("items", []):
             snippet = item.get("snippet", {})
             title, uploader = unescape(snippet.get("title", "")), unescape(snippet.get("channelTitle", ""))
             video = item.get("id", {}).get("videoId", "")
             broadcast = snippet.get("liveBroadcastContent", "none")
+            title_subject = subject(title)
             if (video in seen or not YOUTUBE_ID.fullmatch(video) or broadcast == "upcoming" or
-                    not TOPIC.search(title) or not (alias.search(title) or alias.search(uploader))):
+                    not TOPIC.search(title_subject) or
+                    not (alias.search(title_subject) or alias.search(matching_text(uploader)))):
                 continue
             seen.add(video)
             yield {"lang": lang, "title": title[:140], "url": f"https://www.youtube.com/watch?v={video}",
@@ -144,6 +192,8 @@ def helix(endpoint, params, headers, description):
 
 def twitch_channels(languages, followers, headers):
     requested = list(dict.fromkeys(term for terms in followers.values() for term in terms))
+    if not requested:
+        return {}
     lookups = [("id" if TWITCH_ID.fullmatch(term) else "login", term) for term in requested]
     channels = {}
     for account in helix("users", lookups, headers, "Каналы Twitch"):
@@ -157,30 +207,40 @@ def twitch_channels(languages, followers, headers):
 
 
 def twitch_live(channels, headers):
+    seen = set()
     filters = [("user_id", user_id) for user_id in channels]
     for item in helix("streams", filters, headers, "Прямые эфиры Twitch"):
-        channel = channels.get(item.get("user_id"))
+        user_id = item.get("user_id")
+        channel = channels.get(user_id)
         stream = item.get("id", "")
         title = item.get("title", "")
-        if channel is None or not TWITCH_ID.fullmatch(stream) or item.get("type") != "live":
+        if channel is None or stream in seen or not TWITCH_ID.fullmatch(stream) or item.get("type") != "live":
             continue
-        if not (TOPIC.search(title) or TOPIC.fullmatch(item.get("game_name", ""))):
+        game = item.get("game_name", "")
+        category = matching_text(game)
+        by_title = TOPIC.search(subject(title))
+        by_category = TOPIC.fullmatch(category)
+        if not by_category and not (category in ("", "just chatting") and by_title):
             continue
         login, markets = channel
         for lang, code in markets:
             if item.get("language") == code:
-                yield {"lang": lang, "title": (title or item.get("game_name", ""))[:140],
+                seen.add(stream)
+                yield {"lang": lang, "title": (title or game)[:140],
                        "url": f"https://www.twitch.tv/{login}", "kind": "live",
                        "key": f"twitch:stream:{stream}"}
 
 
-def twitch_vods(channels, headers):
+def twitch_vods(channels, headers, known_live=()):
     after = datetime.now(timezone.utc) - WINDOW
+    seen_videos, seen_streams = set(), set()
     for user_id, (_, markets) in channels.items():
         params = [("user_id", user_id), ("type", "archive"), ("first", "5"), ("sort", "time")]
         for item in helix("videos", params, headers, "Записи Twitch"):
             title, video = item.get("title", ""), item.get("id", "")
-            if not TWITCH_ID.fullmatch(video) or not TOPIC.search(title):
+            stream = item.get("stream_id") or ""
+            if (video in seen_videos or stream in seen_streams or not TWITCH_ID.fullmatch(video) or
+                    item.get("user_id", user_id) != user_id or item.get("type", "archive") != "archive"):
                 continue
             try:
                 created = datetime.fromisoformat(item.get("created_at", ""))
@@ -191,20 +251,26 @@ def twitch_vods(channels, headers):
             for lang, code in markets:
                 if item.get("language") != code:
                     continue
+                if not TOPIC.search(subject(title)):
+                    if (lang, stream) not in known_live:
+                        continue
                 candidate = {"lang": lang, "title": title[:140], "url": f"https://www.twitch.tv/videos/{video}",
                              "kind": "vod"}
-                stream = item.get("stream_id") or ""
                 if TWITCH_ID.fullmatch(stream):
                     candidate["key"] = f"twitch:stream:{stream}"
+                    seen_streams.add(stream)
+                seen_videos.add(video)
                 yield candidate
 
 
-def twitch(languages, live_only=False):
+def twitch(languages, live_only=False, known_live=()):
     client, secret = os.environ.get("TWITCH_CLIENT_ID"), os.environ.get("TWITCH_CLIENT_SECRET")
     followers = {lang: twitch_authors(lang) for lang in languages}
     if not client or not secret or not any(followers.values()):
         return
     headers = twitch_headers(client, secret)
     channels = twitch_channels(languages, followers, headers)
-    if channels:
-        yield from (twitch_live if live_only else twitch_vods)(channels, headers)
+    if channels and live_only:
+        yield from twitch_live(channels, headers)
+    elif channels:
+        yield from twitch_vods(channels, headers, known_live)

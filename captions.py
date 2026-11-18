@@ -37,7 +37,11 @@ def parse_clock(groups):
 
 
 def read_srt(path):
-    source = path.read_text(encoding="utf-8-sig")
+    return parse_srt(path.read_text(encoding="utf-8-sig"))
+
+
+def parse_srt(source, *, split_phrases=True):
+    source = source.removeprefix("\ufeff").replace("\r\n", "\n").replace("\r", "\n")
     captions = []
     for block in re.split(r"\n\s*\n", source.strip()):
         lines = block.splitlines()
@@ -50,7 +54,10 @@ def read_srt(path):
         start, end = parse_clock(timing.groups()[:4]), parse_clock(timing.groups()[4:])
         text = plain_text(" ".join(lines[first_line + 1:]))
         if text and end > start:
-            captions.extend(make_phrases(start, end, text))
+            if split_phrases:
+                captions.extend(make_phrases(start, end, text))
+            else:
+                captions.append(Caption(start, end, text))
     return sorted(captions, key=lambda caption: (caption.start, caption.end))
 
 
@@ -64,6 +71,20 @@ def display_width(text):
     )
 
 
+def headline_words(text):
+    return [token.strip(' ,.!?…«»"—–:;|') for token in plain_text(text).split()
+            if re.search(r"[^\W_]", token)]
+
+
+def short_headline(text):
+    words = headline_words(text)
+    for size in range(min(5, len(words)), 2, -1):
+        title = " ".join(words[:size])
+        if len(title) <= 50:
+            return title
+    return ""
+
+
 def choose_headline(explicit, fallback, captions, peak):
     if explicit:
         return explicit
@@ -72,9 +93,9 @@ def choose_headline(explicit, fallback, captions, peak):
         if len(caption.text.split()) >= 3 and caption.start <= peak + 1.8 and caption.end >= peak - 1.2
     ]
     if not nearby:
-        return fallback
+        return short_headline(fallback) or "Момент из эфира"
     caption = min(nearby, key=lambda cue: max(cue.start - peak, peak - cue.end, 0))
-    return caption.text.strip(" ,.!?…«»") or fallback
+    return short_headline(caption.text) or short_headline(fallback) or "Момент из эфира"
 
 
 def short_groups(tokens):

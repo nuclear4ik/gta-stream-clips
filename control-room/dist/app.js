@@ -12,8 +12,11 @@
   const platformName = platform => platform === 'Reels' ? 'Instagram' : platform;
   const sections = {queue: 'Очередь', sources: 'Источники', accounts: 'Аккаунты', connections: 'Подключения'};
   const defaults = {RU: 'After the Chase | GTA 6', EN: 'One More Job | GTA 6', ESP: 'Una más | GTA 6'};
+  const editModes = {auto: 'Автоматически по видео', model: 'Нейросеть по SRT', manual: 'Точные интервалы'};
+  const configurableSources = new Set(['waiting', 'waiting_layout', 'failed', 'empty']);
+  const maxTranscriptBytes = 512 * 1024;
   const labels = {
-    waiting: 'Нужен исходный файл', queued: 'В работе', editing: 'Монтируется', ready: 'Готово',
+    waiting: 'Нужен исходный файл', waiting_layout: 'Нужны границы камеры', queued: 'В работе', editing: 'Монтируется', ready: 'Готово',
     empty: 'Моменты не найдены', failed: 'Ошибка монтажа', review: 'На проверку', scheduled: 'Запланировано',
     checking: 'Проверка маршрута', sending: 'Отправляется', blocked: 'Заблокировано', unknown: 'Проверьте Studio',
     uploaded: 'Загружено · приватно', cancelled: 'Отменено', route_wait: 'Ждёт подключения',
@@ -100,7 +103,7 @@
   async function uploadSource(file, source) {
     if (!data.live || info) throw new Error('Откройте рабочую панель Streamcut.');
     const query = new URLSearchParams({
-      name: file.name, lang: source.lang, url: source.url, title: source.title,
+      name: file.name, lang: source.lang, url: source.url || '', title: source.title || '',
     });
     if (source.id != null) query.set('id', source.id);
     if (source.mark != null) query.set('mark', source.mark);
@@ -143,7 +146,8 @@
   function queuePage() {
     const active = data.queue.filter(job => !['uploaded', 'cancelled'].includes(job.status));
     const current = job => !filter || job.lang === filter;
-    const unassigned = data.clips?.filter(clip => !data.accounts.some(account => clip.lang === account.lang)) || [];
+    const assigned = new Set(data.queue.map(job => job.clip_id));
+    const unassigned = data.clips?.filter(clip => current(clip) && !assigned.has(clip.id)) || [];
     const history = data.queue.filter(job => ['uploaded', 'cancelled'].includes(job.status) && current(job));
     const counts = Object.fromEntries(Object.keys(markets).map(lang => [
       lang, data.queue_counts?.[lang] ?? new Set(active.filter(job => job.lang === lang).map(job => job.clip_id || job.id)).size,
@@ -170,23 +174,39 @@
           <button class="quiet" data-do="preview" data-id="${clip.id}">Видео</button></div>`).join('') + '</div></details></section>' : ''}`;
   }
 
+  function sourceCard(source, clips) {
+    const id = escape(source.id);
+    return `<article class="job source">
+      <div class="job-title">${badge(source.lang)}<div><strong>${escape(source.title)}</strong>
+        ${source.url ? '<a class="muted" href="' + escape(source.url) + '" target="_blank" rel="noopener noreferrer">Ссылка ↗</a>' : ''}
+        ${source.kind === 'live' ? '<small>Эфир при последней проверке</small>' : source.kind === 'vod' ? '<small>Запись эфира</small>' : ''}
+        ${source.detail ? '<small class="error-note">' + escape(source.detail) + '</small>' : ''}</div></div>
+      <div class="job-actions">${status(source.status)}
+        ${configurableSources.has(source.status) ? '<button data-do="source" data-id="' + id + '">Настроить монтаж</button>' : ''}
+        ${source.status === 'waiting' ? '<button class="quiet" data-do="dismiss" data-id="' + id + '">Скрыть</button>' : ''}</div>
+      ${clips.length ? `<div class="source-clips" aria-label="Готовые клипы">${clips.map(clip =>
+        `<div><span>${escape(clip.title)}</span><button class="quiet" data-do="preview" data-id="${escape(clip.id)}">Смотреть</button></div>`
+      ).join('')}</div>` : ''}</article>`;
+  }
+
   function sourcesPage() {
     const roster = data.roster || {};
+    const clipsBySource = new Map();
+    for (const clip of data.clips || []) {
+      if (!clipsBySource.has(clip.source_id)) clipsBySource.set(clip.source_id, []);
+      clipsBySource.get(clip.source_id).push(clip);
+    }
     return `<div class="heading"><div><h1>Источники</h1><p>YouTube, Twitch и входящие файлы</p></div>${mainButton('+ Источник', 'source')}</div>
       <section class="surface">
         <div class="bar"><div><strong>Автопоиск</strong>
-          <small>${escape(data.search_status || (!data.live ? 'YouTube и Twitch · GTA 6' : data.search_configured ? 'YouTube и Twitch · GTA 6' : 'Активны входящие файлы. Для YouTube и Twitch нужны ключи API.'))}</small></div>
+          <small>${escape(data.search_status || (!data.live ? 'YouTube и Twitch · каждые 5 часов' : data.search_configured ? 'YouTube и Twitch · каждые 5 часов' : 'Активны входящие файлы. Для YouTube и Twitch нужны ключи API.'))}</small></div>
           ${data.live ? '<button class="quiet" data-do="scan" aria-pressed="' + data.settings.scan + '">' + (data.settings.scan ? 'Включён' : 'Выключен') + '</button>' : '<span class="status scheduled">Включён по умолчанию</span>'}</div>
         <div class="roster-grid">${Object.entries(markets).map(([lang, market]) =>
           `<div><strong>${badge(lang)} ${countries[market.country]}</strong>
-            <small>${Array.isArray(roster[lang]) ? roster[lang].map(escape).join(' · ') || 'Список пуст' : 'Список авторов на сервере'}</small></div>`).join('')}</div>
-        ${data.sources.length ? '<div class="job-list">' + data.sources.map(source => `<article class="job source">
-            <div class="job-title">${badge(source.lang)}<div><strong>${escape(source.title)}</strong>
-            ${source.url ? '<a class="muted" href="' + escape(source.url) + '" target="_blank" rel="noopener noreferrer">Ссылка ↗</a>' : ''}
-            ${source.kind === 'live' ? '<small>Прямой эфир</small>' : source.kind === 'vod' ? '<small>Запись эфира</small>' : ''}
-            ${source.detail ? '<small class="error-note">' + escape(source.detail) + '</small>' : ''}</div></div>
-            <div class="job-actions">${status(source.status)}
-            ${source.status === 'waiting' ? '<button data-do="source" data-id="' + source.id + '">Добавить файл</button><button class="quiet" data-do="dismiss" data-id="' + source.id + '">Скрыть</button>' : ''}</div></article>`).join('') + '</div>' :
+            <small>${data.ranking_updated?.[lang] ? 'Топ ' + (roster[lang]?.length || 0) + ' · по свежей активности' : 'Стартовый список · до первой проверки'}</small>
+            <small>${Array.isArray(roster[lang]) ? roster[lang].map(escape).join(' · ') || 'Нет подходящих результатов' : 'Список авторов на сервере'}</small></div>`).join('')}</div>
+        ${data.sources.length ? '<div class="job-list">' + data.sources.map(source =>
+          sourceCard(source, clipsBySource.get(source.id) || [])).join('') + '</div>' :
             '<div class="blank"><strong>Нет источников</strong><p>Добавьте ссылку или положите разрешённый файл в папку нужного языка.</p></div>'}
       </section>`;
   }
@@ -281,18 +301,125 @@
     return '<option value="">Без файла</option>' + (data.files?.[lang] || []).map(name => option(name, name)).join('');
   }
 
-  function sourceForm(id) {
+  async function sourceForm(id) {
     const source = data.sources.find(item => item.id === id);
-    open(source ? 'Прикрепить исходник' : 'Добавить источник', `<form id="source-form" data-id="${id || ''}">
+    let profile = null;
+    if (source) {
+      const response = await fetch('/api/source-edit?' + new URLSearchParams({id}), {
+        cache: 'no-store', signal: AbortSignal.timeout(3000),
+      });
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(result.error || 'Не удалось загрузить настройки монтажа.');
+      profile = result.edit;
+    }
+    const mode = profile?.mode || 'auto';
+    const moments = (profile?.moments || []).map(({start_seconds, end_seconds, headline}) =>
+      [start_seconds, end_seconds, headline].filter(value => value != null && value !== '').join(' — ')).join('\n');
+    open(source ? 'Настроить монтаж' : 'Добавить источник', `<form id="source-form" data-id="${source?.id || ''}">
+      ${['facecam_focus', 'gameplay_focus'].filter(field => profile?.[field]).map(field =>
+        `<input name="${field}" type="hidden" value="${escape(profile[field])}">`).join('')}
       ${!data.live ? '<p class="muted">В предпросмотре доступен только интерфейс. Обработку запускает локальный сервис.</p>' : ''}
-      <label>Язык<select name="lang" ${source ? 'disabled' : ''}>${Object.entries(languages).map(([lang, text]) => option(lang, text, source?.lang)).join('')}</select></label>
-      <label>Ссылка YouTube или Twitch<input name="url" type="url" maxlength="2048" placeholder="https://…" value="${escape(source?.url)}" ${source ? 'readonly' : ''}></label>
-      <label>Название<input name="title" maxlength="140" value="${escape(source?.title)}"></label>
-      <label>Видеофайл<input name="upload" type="file" accept=".mp4,.mkv,.mov,.webm,.ts" ${data.live ? '' : 'disabled'}></label>
-      <details class="form-details"><summary>Выбрать файл на сервере</summary>
-        <label>Входящий файл<select name="file">${files(source?.lang || 'RU')}</select></label></details>
-      <details><summary>Таймкод вручную</summary><label>Секунда исходника<input name="mark" type="number" min="0" max="86400"></label></details>
-      <p class="form-error" role="status"></p><div class="footer"><button class="primary" ${data.live ? '' : 'disabled'}>Сохранить</button></div></form>`);
+      <div class="form-columns">
+        <label>Язык<select name="lang" ${source ? 'disabled' : ''}>${Object.entries(languages).map(([lang, text]) => option(lang, text, source?.lang)).join('')}</select></label>
+        <label>Название источника<input name="title" maxlength="140" value="${escape(source?.title)}"></label>
+      </div>
+      ${!source || source.url ? `<label>Ссылка YouTube или Twitch<input name="url" type="url" maxlength="2048" placeholder="https://…" value="${escape(source?.url)}" ${source ? 'readonly' : ''}></label>` : ''}
+      ${source?.rel_file ? `<small>Исходник: ${escape(source.rel_file)}</small>` : `
+        <label>Видеофайл<input name="upload" type="file" accept=".mp4,.mkv,.mov,.webm,.ts" ${data.live ? '' : 'disabled'}></label>
+        <details class="form-details"><summary>Выбрать файл на сервере</summary>
+          <label>Входящий файл<select name="file">${files(source?.lang || 'RU')}</select></label>
+        </details>`}
+      <details class="form-details" ${data.live ? 'open' : ''}><summary>Монтаж реакции</summary>
+        <div class="source-fields">
+          <div class="form-columns">
+            <label>Веб-камера<input name="facecam" maxlength="100" placeholder="74%,70%,25%,29%" value="${escape(profile?.facecam)}" aria-describedby="region-help"></label>
+            <label>Геймплей (по желанию)<input name="gameplay" maxlength="100" placeholder="0%,0%,74%,100%" value="${escape(profile?.gameplay)}" aria-describedby="region-help"></label>
+          </div>
+          <small id="region-help">Отступ слева, отступ сверху, ширина и высота в пикселях или процентах.</small>
+          <label>Заголовок на видео · 3–5 слов<input name="headline" maxlength="50" placeholder="Погоня через весь город" value="${escape(profile?.headline)}"></label>
+          <label>Выбор моментов<select name="mode">${Object.entries(editModes).map(([value, label]) => option(value, label, mode)).join('')}</select></label>
+          <div data-manual-moments ${mode === 'manual' ? '' : 'hidden'}>
+            <label>Начало и конец клипов<textarea name="moments" rows="3" maxlength="800" placeholder="00:12:15 — 00:12:43 — Погоня через весь город" aria-describedby="moments-help">${escape(moments)}</textarea></label>
+            <small id="moments-help">От 1 до 6 строк. Время в секундах, ММ:СС или ЧЧ:ММ:СС. Третьим полем можно указать заголовок.</small>
+          </div>
+          <label>Расшифровка с таймкодами (SRT)<textarea name="transcript" rows="4" maxlength="524288" placeholder="Вставьте сюда текст SRT">${escape(profile?.transcript)}</textarea></label>
+          <label>Или выберите файл SRT<input name="transcript_file" type="file" accept=".srt"></label>
+          <small>Для точных интервалов и нейросети нужна расшифровка SRT.</small>
+          <details data-auto-mark ${mode === 'auto' ? '' : 'hidden'}><summary>Начать поиск рядом с таймкодом</summary>
+            <label>Секунда исходника<input name="mark" type="number" min="0" max="86400" value="${escape(source?.mark)}"></label>
+          </details>
+        </div>
+      </details>
+      <p class="form-error" role="status"></p>
+      <div class="footer"><button class="primary" ${data.live ? '' : 'disabled'}>Сохранить источник</button></div></form>`);
+  }
+
+  function parseMomentTime(timecode) {
+    const parts = timecode.replace(',', '.').split(':').map(Number);
+    if (parts.slice(1).some(part => part >= 60)) throw new Error('Минуты и секунды таймкода должны быть меньше 60.');
+    return parts.reduce((time, part) => time * 60 + part, 0);
+  }
+
+  function parseMoments(raw) {
+    const lines = raw.split(/\r?\n/).map(line => line.trim()).filter(Boolean);
+    if (!lines.length || lines.length > 6) throw new Error('Укажите от 1 до 6 интервалов, по одному на строку.');
+    const timecode = '[0-9]+(?::[0-9]{1,2}){0,2}(?:[.,][0-9]+)?';
+    const interval = new RegExp('^(' + timecode + ')\\s*[-–—]\\s*(' + timecode + ')(?:\\s*[-–—]\\s*(.+))?$');
+    return lines.map((line, index) => {
+      const match = line.match(interval);
+      if (!match) throw new Error('Интервал ' + (index + 1) + ' нужен в формате «начало — конец».');
+      const [, start, end, headline] = match;
+      const start_seconds = parseMomentTime(start);
+      const end_seconds = parseMomentTime(end);
+      if (start_seconds >= end_seconds || end_seconds > 86400) throw new Error('Укажите начало раньше конца и время в пределах суток.');
+      return {start_seconds, end_seconds, ...(headline ? {headline} : {})};
+    });
+  }
+
+  async function sourceProfile(payload) {
+    const {mode, transcript_file, moments, facecam_focus, gameplay_focus} = payload;
+    const facecam = payload.facecam.trim();
+    const gameplay = payload.gameplay.trim();
+    const headline = payload.headline.trim();
+    let transcript = payload.transcript.trim();
+    if (transcript_file?.name) {
+      if (!transcript_file.size || transcript_file.size > maxTranscriptBytes) throw new Error('Размер файла SRT должен быть от 1 байта до 512 КиБ.');
+      try {
+        transcript = new TextDecoder('utf-8', {fatal: true}).decode(await transcript_file.arrayBuffer()).trim();
+      } catch {
+        throw new Error('Сохраните SRT в кодировке UTF-8.');
+      }
+    }
+    if (!facecam && !gameplay && !headline && !transcript && mode === 'auto') return null;
+    if (!facecam || !headline) throw new Error('Для монтажа реакции укажите область веб-камеры и заголовок.');
+    if (mode !== 'auto' && !transcript) throw new Error('Добавьте расшифровку SRT для выбранного способа монтажа.');
+    if (new TextEncoder().encode(transcript).length > maxTranscriptBytes) throw new Error('Расшифровка SRT должна быть не больше 512 КиБ.');
+    return {facecam, headline, mode, ...(gameplay ? {gameplay} : {}), ...(transcript ? {transcript} : {}),
+      ...(facecam_focus ? {facecam_focus} : {}), ...(gameplay_focus ? {gameplay_focus} : {}),
+      ...(mode === 'manual' ? {moments: parseMoments(moments)} : {})};
+  }
+
+  async function saveSource(form, payload, feedback) {
+    const {title, upload, file, mark} = payload;
+    const id = Number(form.dataset.id);
+    const lang = form.elements.lang.value;
+    const url = payload.url || '';
+    const sourceTitle = title.trim() || upload?.name?.replace(/\.[^.]+$/, '').slice(0, 140) || '';
+    const metadata = {lang, url, title: sourceTitle, mark: payload.mode === 'auto' && mark !== '' ? Number(mark) : null,
+      ...(id ? {id} : {}), ...(file ? {file} : {})};
+    const profile = await sourceProfile(payload);
+    if (profile) metadata.edit = profile;
+    if (!upload?.name) {
+      await post('sources', metadata);
+      return;
+    }
+    if (file) throw new Error('Выберите один видеофайл.');
+    if (!upload.size || upload.size > 2 * 1024 ** 3) throw new Error('Размер видео должен быть от 1 байта до 2 ГиБ.');
+    const prepared = await post('sources', {...metadata, prepare_upload: true, name: upload.name});
+    if (!prepared.id) throw new Error('Сервис не подготовил загрузку исходника. Обновите версию панели.');
+    form.dataset.id = prepared.id;
+    feedback.textContent = 'Загружаю видео…';
+    await uploadSource(upload, {...metadata, id: prepared.id});
   }
 
   function routeOptions(selected) {
@@ -371,7 +498,7 @@
       else openGroups.add(value);
       button.setAttribute('aria-expanded', openGroups.has(value));
       document.getElementById('channels-' + value).hidden = !openGroups.has(value);
-    } else if (action === 'source') sourceForm(id);
+    } else if (action === 'source') await sourceForm(id);
     else if (action === 'account') {
       const account = data.accounts.find(row => row.id === id);
       if (account) accountForm(account);
@@ -425,8 +552,13 @@
 
   dialog.addEventListener('change', event => {
     const form = event.target.form;
-    if (event.target.name === 'lang' && form?.id === 'source-form') {
-      form.elements.file.innerHTML = files(event.target.value);
+    if (form?.id === 'source-form') {
+      if (event.target.name === 'lang' && form.elements.file) {
+        form.elements.file.innerHTML = files(event.target.value);
+      } else if (event.target.name === 'mode') {
+        form.querySelector('[data-manual-moments]').hidden = event.target.value !== 'manual';
+        form.querySelector('[data-auto-mark]').hidden = event.target.value !== 'auto';
+      }
     }
     if (form?.id === 'account-form') {
       if (event.target.name === 'lang') {
@@ -449,20 +581,7 @@
     for (const button of form.querySelectorAll('button')) button.disabled = true;
     try {
       if (form.id === 'source-form') {
-        const source = data.sources.find(row => row.id === Number(form.dataset.id));
-        const {mark, upload, ...sourceData} = payload;
-        const metadata = {
-          ...sourceData, ...(source ? {id: source.id} : {}),
-          lang: source?.lang || payload.lang, mark: mark === '' ? null : Number(mark),
-        };
-        if (upload?.name) {
-          if (sourceData.file) throw new Error('Выберите один видеофайл.');
-          if (!upload.size) throw new Error('Выбранный файл пуст.');
-          error.textContent = 'Загружаю видео…';
-          await uploadSource(upload, metadata);
-        } else {
-          await post('sources', metadata);
-        }
+        await saveSource(form, payload, error);
         location.hash = 'sources';
       } else if (form.id === 'account-form') {
         const {lang, platform} = form.elements;
