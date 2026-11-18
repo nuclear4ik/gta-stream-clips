@@ -175,15 +175,16 @@
     return `<div class="heading"><div><h1>Источники</h1><p>YouTube, Twitch и входящие файлы</p></div>${mainButton('+ Источник', 'source')}</div>
       <section class="surface">
         <div class="bar"><div><strong>Автопоиск</strong>
-          <small>${escape(data.search_status || (!data.live ? 'YouTube и Twitch · GTA 6' : data.search_configured ? 'YouTube и Twitch · GTA 6' : 'Активны входящие файлы. Для YouTube и Twitch нужны ключи API.'))}</small></div>
+          <small>${escape(data.search_status || (!data.live ? 'YouTube и Twitch · каждые 5 часов' : data.search_configured ? 'YouTube и Twitch · каждые 5 часов' : 'Активны входящие файлы. Для YouTube и Twitch нужны ключи API.'))}</small></div>
           ${data.live ? '<button class="quiet" data-do="scan" aria-pressed="' + data.settings.scan + '">' + (data.settings.scan ? 'Включён' : 'Выключен') + '</button>' : '<span class="status scheduled">Включён по умолчанию</span>'}</div>
         <div class="roster-grid">${Object.entries(markets).map(([lang, market]) =>
           `<div><strong>${badge(lang)} ${countries[market.country]}</strong>
-            <small>${Array.isArray(roster[lang]) ? roster[lang].map(escape).join(' · ') || 'Список пуст' : 'Список авторов на сервере'}</small></div>`).join('')}</div>
+            <small>${data.ranking_updated?.[lang] ? 'Топ ' + (roster[lang]?.length || 0) + ' · по свежей активности' : 'Стартовый список · до первой проверки'}</small>
+            <small>${Array.isArray(roster[lang]) ? roster[lang].map(escape).join(' · ') || 'Нет подходящих результатов' : 'Список авторов на сервере'}</small></div>`).join('')}</div>
         ${data.sources.length ? '<div class="job-list">' + data.sources.map(source => `<article class="job source">
             <div class="job-title">${badge(source.lang)}<div><strong>${escape(source.title)}</strong>
             ${source.url ? '<a class="muted" href="' + escape(source.url) + '" target="_blank" rel="noopener noreferrer">Ссылка ↗</a>' : ''}
-            ${source.kind === 'live' ? '<small>Прямой эфир</small>' : source.kind === 'vod' ? '<small>Запись эфира</small>' : ''}
+            ${source.kind === 'live' ? '<small>Эфир при последней проверке</small>' : source.kind === 'vod' ? '<small>Запись эфира</small>' : ''}
             ${source.detail ? '<small class="error-note">' + escape(source.detail) + '</small>' : ''}</div></div>
             <div class="job-actions">${status(source.status)}
             ${source.status === 'waiting' ? '<button data-do="source" data-id="' + source.id + '">Добавить файл</button><button class="quiet" data-do="dismiss" data-id="' + source.id + '">Скрыть</button>' : ''}</div></article>`).join('') + '</div>' :

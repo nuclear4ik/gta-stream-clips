@@ -25,6 +25,7 @@ from urllib.parse import parse_qs, urlencode, urlsplit
 import connections
 import discovery
 import metrics
+import regional
 import schedule
 import transport
 
@@ -94,7 +95,15 @@ INSERT OR IGNORE INTO settings VALUES ('scan', 1), ('paused', 0);
 CREATE TABLE IF NOT EXISTS sources (
     id INTEGER PRIMARY KEY, lang TEXT NOT NULL, title TEXT NOT NULL, url TEXT NOT NULL,
     source_key TEXT UNIQUE, rel_file TEXT, fingerprint TEXT UNIQUE, mark INTEGER,
-    status TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '', created TEXT NOT NULL, kind TEXT, queued_at TEXT
+    status TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '', created TEXT NOT NULL, kind TEXT, queued_at TEXT,
+    last_seen TEXT
+);
+CREATE TABLE IF NOT EXISTS discovery_feeds (
+    lang TEXT NOT NULL, provider TEXT NOT NULL, checked_at TEXT NOT NULL, payload TEXT NOT NULL,
+    PRIMARY KEY(lang, provider)
+);
+CREATE TABLE IF NOT EXISTS discovery_runs (
+    name TEXT PRIMARY KEY, started_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS clips (
     id INTEGER PRIMARY KEY, source_id INTEGER REFERENCES sources(id), lang TEXT NOT NULL,
@@ -138,6 +147,7 @@ class Studio:
         self.pending_auth = {}
         self.scanned = {}
         self.inbox_lock = Lock()
+        self.search_lock = Lock()
         self.search_status = ""
         self.dbfile = self.root / "studio.db"
         with self.db() as db:
@@ -148,6 +158,8 @@ class Studio:
             if "queued_at" not in {row["name"] for row in db.execute("PRAGMA table_info(sources)")}:
                 db.execute("ALTER TABLE sources ADD COLUMN queued_at TEXT")
                 db.execute("UPDATE sources SET queued_at=created WHERE rel_file IS NOT NULL")
+            if "last_seen" not in {row["name"] for row in db.execute("PRAGMA table_info(sources)")}:
+                db.execute("ALTER TABLE sources ADD COLUMN last_seen TEXT")
             if "verified" not in {row["name"] for row in db.execute("PRAGMA table_info(clips)")}:
                 db.execute("ALTER TABLE clips ADD COLUMN verified INTEGER NOT NULL DEFAULT 0")
             db.execute("UPDATE sources SET status='queued' WHERE status='editing'")
@@ -210,7 +222,8 @@ class Studio:
         with self.db() as db:
             settings = {r["name"]: bool(r["value"]) for r in db.execute("SELECT * FROM settings")}
             sources = [dict(row) for row in db.execute("""SELECT id, lang, title, url, rel_file,
-                        status, detail, kind FROM sources WHERE status!='dismissed' ORDER BY id DESC LIMIT 100""")]
+                        status, detail, kind FROM sources WHERE status NOT IN ('dismissed','expired') ORDER BY id DESC LIMIT 100""")]
+            roster, ranking_updated, _ = self.current_discovery(db, now())
             accounts = []
             for row in db.execute("""SELECT a.id, a.lang, a.platform, a.name, a.target,
                           a.route, a.auto, a.refresh_token IS NOT NULL AS connected, m.payload
@@ -231,17 +244,17 @@ class Studio:
                        ORDER BY CASE WHEN q.status IN ('uploaded','cancelled') THEN 1 ELSE 0 END, q.at LIMIT 500""")]
         return {"live": True, "settings": settings, "sources": sources, "accounts": accounts,
                 "connections": self.connection_snapshot(checks), "queue_counts": queue_counts,
-                "roster": discovery.roster(),
+                "roster": roster, "ranking_updated": ranking_updated,
                 "clips": clips, "queue": queue, "files": self.available_files(300),
                 "routes": {r: transport.route_available(r) for r in transport.REGIONS},
                 "oauth": transport.youtube_configured(), "uploads": self.uploads_enabled(),
-                "search_configured": discovery.configured(), "search_status": self.search_status}
+                "search_configured": regional.configured(), "search_status": self.search_status}
 
     @staticmethod
     def uploads_enabled():
         return os.environ.get("STREAMCUT_YOUTUBE_UPLOAD") == "1"
 
-    def add_source(self, data, key_override=None, file_digest=None):
+    def add_source(self, data, key_override=None, file_digest=None, discovered_at=None):
         lang = language(data)
         url, key = source_url(text_field(data, "url", 2048))
         if key_override:
@@ -275,10 +288,25 @@ class Studio:
                     raise ValueError("Источник уже изменился. Откройте его снова.")
             else:
                 existing = db.execute("SELECT * FROM sources WHERE source_key=?", (key,)).fetchone()
-            if existing and existing["status"] == "waiting" and existing["kind"] == "live" and kind == "vod":
+                if not existing and discovered_at and kind == "vod":
+                    existing = db.execute("SELECT * FROM sources WHERE url=? AND lang=? ORDER BY id LIMIT 1",
+                                          (url, lang)).fetchone()
+            if existing and discovered_at:
+                if existing["lang"] != lang or existing["status"] == "dismissed":
+                    return False
+                transition = existing["kind"] == "live" and kind in ("vod", "video")
+                refreshed = existing["status"] == "expired"
+                db.execute("""UPDATE sources SET
+                              last_seen=CASE WHEN last_seen IS NOT NULL THEN ? ELSE NULL END,
+                              status=CASE WHEN status='expired' THEN 'waiting' ELSE status END, url=CASE WHEN ? THEN ? ELSE url END,
+                              title=CASE WHEN ? THEN ? ELSE title END, kind=CASE WHEN ? THEN ? ELSE kind END
+                              WHERE id=?""", (discovered_at, transition, url, transition,
+                                              title or existing["title"], transition, kind, existing["id"]))
+                return refreshed
+            if existing and existing["status"] == "waiting" and existing["kind"] == "live" and kind == "vod" and not file:
                 db.execute("UPDATE sources SET url=?,title=?,kind=? WHERE id=?",
                            (url, title or existing["title"], kind, existing["id"]))
-                return
+                return False
             if existing and (existing["status"] != "waiting" or not file or existing["lang"] != lang):
                 raise ValueError("Этот источник уже есть или указан другой язык.")
             if fingerprint and db.execute("SELECT 1 FROM sources WHERE fingerprint=?", (fingerprint,)).fetchone():
@@ -289,12 +317,13 @@ class Studio:
                                   WHERE id=?""", (file, fingerprint, status, mark, title or Path(file).stem,
                                                  entered, existing["id"]))
                 else:
-                    db.execute("""INSERT INTO sources(lang,title,url,source_key,rel_file,fingerprint,mark,status,created,kind,queued_at)
-                                  VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                    db.execute("""INSERT INTO sources(lang,title,url,source_key,rel_file,fingerprint,mark,status,created,kind,queued_at,last_seen)
+                                  VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
                                (lang, title or (Path(file).stem if file else urlsplit(url).netloc), url,
-                                key or None, file or None, fingerprint, mark, status, entered, kind, entered if file else None))
+                                key or None, file or None, fingerprint, mark, status, entered, kind, entered if file else None, discovered_at))
             except sqlite3.IntegrityError:
                 raise ValueError("Этот файл или источник уже был добавлен.") from None
+        return True
 
     def receive_video(self, stream, size, metadata):
         lang = language(metadata)
@@ -414,13 +443,26 @@ class Studio:
             if not enabled:
                 db.execute("UPDATE queue SET status='review',detail='' WHERE account_id=? AND status IN ('scheduled','route_wait')", (identifier,))
 
+    @staticmethod
+    def inbox_key(filename):
+        stem = Path(filename).stem
+        if matched := re.fullmatch(r"youtube-([A-Za-z0-9_-]{11})", stem):
+            return f"youtube:{matched[1]}", f"https://www.youtube.com/watch?v={matched[1]}"
+        if matched := re.fullmatch(r"twitch-vod-([0-9]{1,30})", stem):
+            return f"twitch:vod:{matched[1]}", f"https://www.twitch.tv/videos/{matched[1]}"
+        if matched := re.fullmatch(r"twitch-stream-([0-9]{1,30})", stem):
+            return f"twitch:stream:{matched[1]}", ""
+        return None
+
     def scan(self):
         with self.db() as db:
             if not db.execute("SELECT value FROM settings WHERE name='scan'").fetchone()[0]:
                 return
-            known = {(r["lang"], r["rel_file"]) for r in db.execute("SELECT lang,rel_file FROM sources WHERE rel_file IS NOT NULL")}
+            known = {(r["lang"], r["rel_file"]) for r in db.execute(
+                "SELECT lang,rel_file FROM sources WHERE rel_file IS NOT NULL")}
         for lang, files in self.available_files().items():
             for file in files:
+                observed = None
                 if (lang, file) in known:
                     continue
                 try:
@@ -429,41 +471,122 @@ class Studio:
                     observed = (stat.st_size, stat.st_mtime_ns)
                     if time.time() - stat.st_mtime < 5 or self.scanned.get((lang, file)) == observed:
                         continue
-                    self.scanned[lang, file] = observed
+                    source = {"lang": lang, "file": file}
+                    if identity := self.inbox_key(file):
+                        with self.db() as db:
+                            record = db.execute("""SELECT id,url,title FROM sources WHERE lang=? AND status='waiting'
+                                                AND (source_key=? OR url=?) ORDER BY id DESC LIMIT 1""",
+                                                (lang, *identity)).fetchone()
+                        if not record:
+                            # A drop from an authorized source may arrive before the API metadata.
+                            continue
+                        source.update(dict(record))
                     with self.inbox_lock:
-                        self.add_source({"lang": lang, "file": file})
+                        self.add_source(source)
+                    self.scanned[lang, file] = observed
                 except (OSError, ValueError):
-                    continue
+                    if self.inbox_key(file) is None and observed is not None:
+                        self.scanned[lang, file] = observed
 
-    def search(self, live_only=False):
-        if not discovery.configured():
+    @staticmethod
+    def current_discovery(db, instant):
+        fallback = discovery.roster()
+        roster, updated, candidates = {}, {}, {}
+        rows = db.execute("SELECT lang,provider,checked_at,payload FROM discovery_feeds").fetchall()
+        for lang in LANGS:
+            feeds = [row for row in rows if row["lang"] == lang and
+                     datetime.fromisoformat(row["checked_at"]) >= instant - discovery.WINDOW]
+            data = regional.current_candidates((item for row in feeds for item in json.loads(row["payload"])), instant)
+            board = regional.leaderboard(data)
+            candidates[lang] = (board, data)
+            if feeds:
+                updated[lang] = max(row["checked_at"] for row in feeds)
+                roster[lang] = [row["creator"] for row in board]
+            else:
+                roster[lang] = fallback.get(lang, [])[:regional.BOARD_SIZE]
+        return roster, updated, candidates
+
+    def search(self, *, force=False, live_only=False):
+        if not regional.configured():
             return
+        if not self.search_lock.acquire(blocking=False):
+            return
+        try:
+            self.search_cycle(force, live_only)
+        finally:
+            self.search_lock.release()
+
+    def search_cycle(self, force, live_only):
+        instant = now()
+        checked = iso(instant)
         with self.db() as db:
+            db.execute("BEGIN IMMEDIATE")
             if not db.execute("SELECT value FROM settings WHERE name='scan'").fetchone()[0]:
                 return
-            count = db.execute("SELECT count(*) FROM sources WHERE status='waiting'").fetchone()[0]
-        if count >= 100:
-            self.search_status = "Лимит кандидатов. Уберите лишние источники."
-            return
-        saved, errors = 0, []
-        feeds = [] if live_only else [discovery.youtube(lang, code) for lang, code in LANGS.items()]
-        feeds.append(discovery.twitch(LANGS, live_only=live_only))
-        for feed in feeds:
+            previous = db.execute("SELECT started_at FROM discovery_runs WHERE name='regional'").fetchone()
+            if not force and previous and datetime.fromisoformat(previous[0]) + timedelta(
+                    seconds=regional.REGIONAL_INTERVAL) > instant:
+                return
+            if not live_only:
+                db.execute("INSERT OR REPLACE INTO discovery_runs VALUES ('regional',?)", (checked,))
+            past_live = {(row["lang"], row["source_key"].rsplit(":", 1)[1]) for row in db.execute(
+                """SELECT lang,source_key FROM sources WHERE kind='live' AND source_key LIKE 'twitch:stream:%'
+                   AND COALESCE(last_seen,created)>=?""", (iso(instant - discovery.WINDOW),))}
+            _, _, old = self.current_discovery(db, instant)
+            old_twitch = [item for _, entries in old.values() for item in entries
+                          if item["provider"] == "Twitch" and item.get("twitch_login")]
+            active_watch = {item["twitch_user"]: (item["twitch_login"], item["lang"])
+                            for item in old_twitch if item["kind"] == "live"}
+            past_live.update((item["lang"], item["key"].rsplit(":", 1)[1])
+                             for item in old_twitch if item["kind"] == "live")
+        updates, errors = [], []
+        for lang, code in LANGS.items():
             try:
-                for candidate in feed:
-                    try:
-                        self.add_source(candidate, key_override=candidate.get("key"))
-                        saved += 1
-                    except ValueError:
-                        pass
-                    if count + saved >= 100:
-                        break
-            except (transport.ConnectionProblem, ValueError) as error:
-                errors.append(str(error))
-            if count + saved >= 100:
-                break
-        if errors or saved or not live_only:
-            self.search_status = " · ".join(errors) if errors else f"Найдено новых: {saved}"
+                rows = regional.youtube_market(lang, code, instant, live_only=live_only)
+                if rows is not None:
+                    updates.append((lang, "YouTube", rows))
+            except transport.ConnectionProblem as error:
+                errors.append(f"{lang} · {error}")
+        try:
+            twitch = regional.twitch_markets(LANGS, instant, past_live, active_watch, live_only=live_only)
+            updates.extend((lang, "Twitch", rows) for lang, rows in (twitch or {}).items())
+        except transport.ConnectionProblem as error:
+            errors.append(str(error))
+        with self.db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            for lang, provider, items in updates:
+                if live_only:
+                    cached = [item for item in old[lang][1] if item["provider"] == provider and item["kind"] != "live"]
+                    items = [*cached, *items]
+                items = regional.current_candidates(items, instant)
+                db.execute("INSERT OR REPLACE INTO discovery_feeds VALUES (?,?,?,?)",
+                           (lang, provider, checked, json.dumps(items, ensure_ascii=False)))
+            _, _, candidates = self.current_discovery(db, instant)
+            known_keys = {row["source_key"] for row in db.execute(
+                """SELECT source_key FROM sources WHERE status!='dismissed' AND kind='live'
+                   AND COALESCE(last_seen,created)>=?""", (iso(instant - discovery.WINDOW),))}
+        saved = 0
+        for board, rows in candidates.values():
+            eligible = {item["author"] for item in board}
+            per_author = {}
+            for row in sorted(rows, key=lambda item: (item["popularity"], item["observed"]), reverse=True):
+                author, key = row["author"], row["key"]
+                if key not in known_keys and (author not in eligible or per_author.get(author, 0) >= 2):
+                    continue
+                per_author[author] = per_author.get(author, 0) + 1
+                try:
+                    saved += self.add_source(row, key_override=key, discovered_at=row["observed"])
+                except ValueError:
+                    continue
+        with self.db() as db:
+            db.execute("""UPDATE sources SET status='expired' WHERE status='waiting' AND last_seen IS NOT NULL
+                          AND (last_seen < ? OR (kind='live' AND last_seen < ?))""",
+                       (iso(instant - discovery.WINDOW), iso(instant - timedelta(hours=6))))
+            for lang in LANGS:
+                db.execute("""UPDATE sources SET status='expired' WHERE id IN (
+                    SELECT id FROM sources WHERE lang=? AND status='waiting' AND last_seen IS NOT NULL
+                    ORDER BY last_seen DESC,id DESC LIMIT -1 OFFSET 30)""", (lang,))
+        self.search_status = " · ".join(errors) if errors else f"Новые источники: {saved} · проверка раз в 5 часов"
 
     def dismiss_source(self, identifier):
         with self.db() as db:
@@ -970,8 +1093,7 @@ def main():
 
             Thread(target=studio.loop, args=(edit_cycle, 4), daemon=True).start()
             Thread(target=studio.loop, args=(studio.publish_one, 8), daemon=True).start()
-            Thread(target=studio.loop, args=(studio.search, 6 * 3600), daemon=True).start()
-            Thread(target=studio.loop, args=(lambda: studio.search(live_only=True), 15 * 60), daemon=True).start()
+            Thread(target=studio.loop, args=(studio.search, 60), daemon=True).start()
             Thread(target=studio.loop, args=(studio.monitor_connections, 60), daemon=True).start()
             Thread(target=studio.loop, args=(studio.refresh_metrics, 60), daemon=True).start()
             print(f"Streamcut: http://127.0.0.1:{server.server_port}/", flush=True)
