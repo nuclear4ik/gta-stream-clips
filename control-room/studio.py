@@ -25,6 +25,7 @@ from urllib.parse import parse_qs, urlencode, urlsplit
 import connections
 import discovery
 import metrics
+import reaction
 import regional
 import schedule
 import transport
@@ -594,10 +595,15 @@ class Studio:
 
     def edit_one(self):
         with self.db() as db:
-            source = db.execute("SELECT * FROM sources WHERE status='queued' ORDER BY queued_at,id LIMIT 1").fetchone()
+            pending = db.execute("""
+                SELECT * FROM sources WHERE status IN ('queued','waiting_layout')
+                AND rel_file IS NOT NULL ORDER BY queued_at,id
+            """)
+            source = next((row for row in pending if row["status"] == "queued" or reaction.has_profile(
+                self.input / row["lang"] / row["rel_file"])), None)
             if source is None:
                 return
-            db.execute("UPDATE sources SET status='editing' WHERE id=?", (source["id"],))
+            db.execute("UPDATE sources SET status='editing', detail='' WHERE id=?", (source["id"],))
         dest = self.output / f"source-{source['id']}"
         try:
             path = self.media_file(source["lang"], source["rel_file"])
@@ -605,13 +611,15 @@ class Studio:
                 if hashlib.file_digest(stream, "sha256").hexdigest() != source["fingerprint"]:
                     raise ValueError("Файл изменился после добавления.")
             cmd = [sys.executable, str(HERE.parent / "clips.py"), str(path), "--output", str(dest),
-                   "--topic", "GTA 6", "--layout", "crop", "--count", "3", "--seconds", "35"]
+                   "--topic", "GTA 6", "--count", "3", "--seconds", "35"]
+            cmd.extend(reaction.editor_arguments(
+                path, required=bool(source["url"]) or os.environ.get("STREAMCUT_REACTION_ONLY") == "1",
+                transcribe=os.environ.get("STREAMCUT_TRANSCRIBE") == "1",
+            ))
             if source["url"]:
                 cmd.extend(("--source-url", source["url"]))
             if source["mark"] is not None:
                 cmd.extend(("--at", str(source["mark"])))
-            if os.environ.get("STREAMCUT_TRANSCRIBE") == "1":
-                cmd.extend(("--transcribe", "--burn-captions"))
             manifest = dest / "manifest.json"
             if not manifest.exists():
                 run = subprocess.run(cmd, cwd=HERE.parent, capture_output=True, text=True, timeout=7200)
@@ -635,6 +643,10 @@ class Studio:
                            ("ready" if clips else "empty", "" if clips else "Добавьте источник с таймкодом.",
                             source["id"]))
                 self.populate(db)
+        except reaction.MissingReactionProfile as error:
+            with self.db() as db:
+                db.execute("UPDATE sources SET status='waiting_layout', detail=? WHERE id=?",
+                           (str(error), source["id"]))
         except (ValueError, OSError, subprocess.TimeoutExpired, KeyError) as error:
             with self.db() as db:
                 db.execute("UPDATE sources SET status='failed', detail=? WHERE id=?",
