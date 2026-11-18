@@ -13,7 +13,7 @@
   const sections = {queue: 'Очередь', sources: 'Источники', accounts: 'Аккаунты', connections: 'Подключения'};
   const defaults = {RU: 'After the Chase | GTA 6', EN: 'One More Job | GTA 6', ESP: 'Una más | GTA 6'};
   const labels = {
-    waiting: 'Нужен исходный файл', queued: 'В работе', editing: 'Монтируется', ready: 'Готово',
+    waiting: 'Нужен исходный файл', waiting_layout: 'Нужны границы камеры', queued: 'В работе', editing: 'Монтируется', ready: 'Готово',
     empty: 'Моменты не найдены', failed: 'Ошибка монтажа', review: 'На проверку', scheduled: 'Запланировано',
     checking: 'Проверка маршрута', sending: 'Отправляется', blocked: 'Заблокировано', unknown: 'Проверьте Studio',
     uploaded: 'Загружено · приватно', cancelled: 'Отменено', route_wait: 'Ждёт подключения',
