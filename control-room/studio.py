@@ -1,0 +1,988 @@
+"""Single-owner Streamcut service. Run behind SSH forwarding or on the local Mac."""
+import argparse
+import base64
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing, contextmanager
+from datetime import datetime, timedelta, timezone
+import fcntl
+import hashlib
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+import json
+import logging
+import os
+from pathlib import Path
+import re
+import secrets
+import signal
+import sqlite3
+import subprocess
+import sys
+from tempfile import NamedTemporaryFile
+from threading import Event, Lock, Thread
+import time
+from urllib.parse import parse_qs, urlencode, urlsplit
+
+import connections
+import discovery
+import metrics
+import schedule
+import transport
+
+HERE = Path(__file__).resolve().parent
+LANGS = {"RU": "ru", "EN": "en", "ESP": "es"}
+UTC = timezone.utc
+MEDIA = {".mp4", ".mkv", ".mov", ".webm", ".ts"}
+CHANNEL_RE = re.compile(r"UC[A-Za-z0-9_-]{22}")
+
+
+def now():
+    return datetime.now(UTC)
+
+
+def iso(date):
+    return date.astimezone(UTC).isoformat(timespec="seconds")
+
+
+def text_field(data, name, limit):
+    value = data.get(name, "")
+    if not isinstance(value, str) or len(value) > limit:
+        raise ValueError("Проверьте заполнение полей.")
+    return value.strip()
+
+
+def language(data):
+    lang = text_field(data, "lang", 3)
+    if lang not in LANGS:
+        raise ValueError("Выберите язык RU, EN или ESP.")
+    return lang
+
+
+def source_url(raw):
+    if not raw:
+        return "", ""
+    url = urlsplit(raw)
+    host = (url.hostname or "").removeprefix("www.")
+    if url.scheme != "https" or url.username or url.password or url.port:
+        raise ValueError("Нужна обычная HTTPS-ссылка без данных входа.")
+    if host in ("youtube.com", "m.youtube.com", "youtu.be"):
+        video = parse_qs(url.query).get("v", [""])[0] if url.path == "/watch" else ""
+        if host == "youtu.be":
+            video = url.path.strip("/")
+        elif m := re.fullmatch(r"/(?:shorts|live|embed)/([\w-]+)/?", url.path, re.ASCII):
+            video = m[1]
+        if re.fullmatch(r"[a-zA-Z0-9_-]{11}", video):
+            return f"https://www.youtube.com/watch?v={video}", f"youtube:{video}"
+    elif host == "twitch.tv":
+        if m := re.fullmatch(r"/videos/([0-9]+)/?", url.path):
+            return f"https://www.twitch.tv/videos/{m[1]}", f"twitch:vod:{m[1]}"
+        if m := re.fullmatch(r"/([a-zA-Z0-9_]{3,25})/?", url.path):
+            login = m[1].lower()
+            if login not in {"directory", "settings", "downloads", "subscriptions", "inventory",
+                             "wallet", "search", "videos"}:
+                return f"https://www.twitch.tv/{login}", f"twitch:live:{login}"
+    raise ValueError("Укажите конкретное видео YouTube, запись или канал Twitch.")
+
+
+ACCOUNTS_SCHEMA = """(
+    id INTEGER PRIMARY KEY, lang TEXT NOT NULL, platform TEXT NOT NULL, name TEXT NOT NULL,
+    target TEXT NOT NULL, route TEXT NOT NULL, auto INTEGER NOT NULL DEFAULT 0,
+    refresh_token TEXT, UNIQUE(platform, target)
+)"""
+SCHEMA = """
+CREATE TABLE IF NOT EXISTS settings (name TEXT PRIMARY KEY, value INTEGER NOT NULL);
+INSERT OR IGNORE INTO settings VALUES ('scan', 1), ('paused', 0);
+CREATE TABLE IF NOT EXISTS sources (
+    id INTEGER PRIMARY KEY, lang TEXT NOT NULL, title TEXT NOT NULL, url TEXT NOT NULL,
+    source_key TEXT UNIQUE, rel_file TEXT, fingerprint TEXT UNIQUE, mark INTEGER,
+    status TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '', created TEXT NOT NULL, kind TEXT, queued_at TEXT
+);
+CREATE TABLE IF NOT EXISTS clips (
+    id INTEGER PRIMARY KEY, source_id INTEGER REFERENCES sources(id), lang TEXT NOT NULL,
+    title TEXT NOT NULL, relative_path TEXT NOT NULL, verified INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS accounts """ + ACCOUNTS_SCHEMA + """;
+CREATE TABLE IF NOT EXISTS account_metrics (
+    account_id INTEGER PRIMARY KEY REFERENCES accounts(id), payload TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS route_health (
+    route TEXT NOT NULL, platform TEXT NOT NULL, state TEXT NOT NULL, country TEXT,
+    detail TEXT NOT NULL, checked_at TEXT NOT NULL, PRIMARY KEY(route, platform)
+);
+CREATE TABLE IF NOT EXISTS queue (
+    id INTEGER PRIMARY KEY, clip_id INTEGER NOT NULL REFERENCES clips(id),
+    account_id INTEGER NOT NULL REFERENCES accounts(id), at TEXT NOT NULL,
+    status TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '', external_id TEXT, sent_at TEXT,
+    UNIQUE(clip_id, account_id)
+);
+"""
+
+
+class Studio:
+    def __init__(self, root, stop=None):
+        self.root = root.resolve()
+        self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        if self.root.stat().st_mode & 0o077:
+            raise ValueError("Папка данных должна быть доступна только владельцу (chmod 700).")
+        self.input = self.root / "inbox"
+        self.output = self.root / "exports"
+        self.output.mkdir(exist_ok=True)
+        for lang in LANGS:
+            (self.input / lang).mkdir(parents=True, exist_ok=True)
+        self.lease = (self.root / "service.lock").open("a")
+        try:
+            fcntl.flock(self.lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            self.lease.close()
+            raise ValueError("Сервис с этой папкой данных уже запущен.") from None
+        self.stop = stop or Event()
+        self.pending_auth = {}
+        self.scanned = {}
+        self.inbox_lock = Lock()
+        self.search_status = ""
+        self.dbfile = self.root / "studio.db"
+        with self.db() as db:
+            db.executescript(SCHEMA)
+            self.migrate_accounts(db)
+            if "kind" not in {row["name"] for row in db.execute("PRAGMA table_info(sources)")}:
+                db.execute("ALTER TABLE sources ADD COLUMN kind TEXT")
+            if "queued_at" not in {row["name"] for row in db.execute("PRAGMA table_info(sources)")}:
+                db.execute("ALTER TABLE sources ADD COLUMN queued_at TEXT")
+                db.execute("UPDATE sources SET queued_at=created WHERE rel_file IS NOT NULL")
+            if "verified" not in {row["name"] for row in db.execute("PRAGMA table_info(clips)")}:
+                db.execute("ALTER TABLE clips ADD COLUMN verified INTEGER NOT NULL DEFAULT 0")
+            db.execute("UPDATE sources SET status='queued' WHERE status='editing'")
+            db.execute("UPDATE queue SET status='scheduled', detail='' WHERE status='checking'")
+            db.execute("""UPDATE queue SET status='unknown', detail='Проверьте YouTube Studio перед повтором.'
+                          WHERE status='sending'""")
+
+    @staticmethod
+    def migrate_accounts(db):
+        for entry in db.execute("PRAGMA index_list(accounts)").fetchall():
+            columns = [r["name"] for r in db.execute(
+                "SELECT name FROM pragma_index_info(?) ORDER BY seqno", (entry["name"],))]
+            if columns == ["lang", "platform"] and entry["unique"]:
+                break
+        else:
+            return
+        db.execute("PRAGMA foreign_keys=OFF")
+        try:
+            db.execute("BEGIN IMMEDIATE")
+            db.execute("CREATE TABLE accounts_new " + ACCOUNTS_SCHEMA)
+            db.execute("INSERT INTO accounts_new SELECT id,lang,platform,name,target,route,auto,refresh_token FROM accounts")
+            db.execute("DROP TABLE accounts")
+            db.execute("ALTER TABLE accounts_new RENAME TO accounts")
+            if db.execute("PRAGMA foreign_key_check").fetchone():
+                raise ValueError("Ошибка переноса аккаунтов. Данные сохранены без изменений.")
+            db.commit()
+        except Exception:
+            db.rollback()
+            raise
+        finally:
+            db.execute("PRAGMA foreign_keys=ON")
+
+    def close(self):
+        self.lease.close()
+
+    @contextmanager
+    def db(self):
+        with closing(sqlite3.connect(self.dbfile, timeout=10)) as db:
+            db.row_factory = sqlite3.Row
+            db.execute("PRAGMA foreign_keys=ON")
+            with db:
+                yield db
+
+    def media_file(self, lang, filename):
+        if not filename or Path(filename).name != filename or Path(filename).suffix.lower() not in MEDIA:
+            raise ValueError("Выберите видео из папки входящих файлов.")
+        path = self.input / lang / filename
+        if path.is_symlink() or not path.is_file() or path.resolve().parent != self.input / lang:
+            raise ValueError("Файл не найден в папке выбранного языка.")
+        return path
+
+    def available_files(self, limit=None):
+        result = {}
+        for lang in LANGS:
+            result[lang] = sorted(path.name for path in (self.input / lang).iterdir()
+                                  if path.suffix.lower() in MEDIA and path.is_file() and not path.is_symlink())[:limit]
+        return result
+
+    def snapshot(self):
+        with self.db() as db:
+            settings = {r["name"]: bool(r["value"]) for r in db.execute("SELECT * FROM settings")}
+            sources = [dict(row) for row in db.execute("""SELECT id, lang, title, url, rel_file,
+                        status, detail, kind FROM sources WHERE status!='dismissed' ORDER BY id DESC LIMIT 100""")]
+            accounts = []
+            for row in db.execute("""SELECT a.id, a.lang, a.platform, a.name, a.target,
+                          a.route, a.auto, a.refresh_token IS NOT NULL AS connected, m.payload
+                          FROM accounts a LEFT JOIN account_metrics m ON m.account_id=a.id ORDER BY a.id"""):
+                item = dict(row)
+                payload = item.pop("payload")
+                item["stats"] = json.loads(payload) if payload else {}
+                accounts.append(item)
+            checks = [dict(row) for row in db.execute("SELECT * FROM route_health")]
+            queue_counts = {lang: 0 for lang in LANGS}
+            queue_counts.update(dict(db.execute("""SELECT c.lang,count(DISTINCT c.id)
+               FROM queue q JOIN clips c ON c.id=q.clip_id WHERE q.status NOT IN ('uploaded','cancelled')
+               GROUP BY c.lang""").fetchall()))
+            clips = [dict(row) for row in db.execute("SELECT id, lang, title FROM clips ORDER BY id DESC LIMIT 100")]
+            queue = [dict(row) for row in db.execute("""SELECT q.id, q.clip_id, q.at, q.status, q.detail,
+                       q.external_id, c.title, c.lang, a.name AS account, a.platform
+                       FROM queue q JOIN clips c ON c.id=q.clip_id JOIN accounts a ON a.id=q.account_id
+                       ORDER BY CASE WHEN q.status IN ('uploaded','cancelled') THEN 1 ELSE 0 END, q.at LIMIT 500""")]
+        return {"live": True, "settings": settings, "sources": sources, "accounts": accounts,
+                "connections": self.connection_snapshot(checks), "queue_counts": queue_counts,
+                "roster": discovery.roster(),
+                "clips": clips, "queue": queue, "files": self.available_files(300),
+                "routes": {r: transport.route_available(r) for r in transport.REGIONS},
+                "oauth": transport.youtube_configured(), "uploads": self.uploads_enabled(),
+                "search_configured": discovery.configured(), "search_status": self.search_status}
+
+    @staticmethod
+    def uploads_enabled():
+        return os.environ.get("STREAMCUT_YOUTUBE_UPLOAD") == "1"
+
+    def add_source(self, data, key_override=None, file_digest=None):
+        lang = language(data)
+        url, key = source_url(text_field(data, "url", 2048))
+        if key_override:
+            key = key_override
+        kind = data.get("kind") if data.get("kind") in ("live", "vod", "video") else None
+        identifier = data.get("id")
+        if identifier is not None and type(identifier) is not int:
+            raise ValueError("Неверный источник.")
+        file = text_field(data, "file", 255)
+        title = text_field(data, "title", 140)
+        mark = data.get("mark")
+        if mark is not None and (type(mark) is not int or not 0 <= mark <= 86400):
+            raise ValueError("Таймкод задаётся в секундах, от 0 до 86400.")
+        if not (url or file):
+            raise ValueError("Укажите ссылку или выберите входящий файл.")
+        fingerprint = None
+        if file:
+            path = self.media_file(lang, file)
+            if file_digest is not None:
+                fingerprint = file_digest
+            else:
+                with path.open("rb") as stream:
+                    fingerprint = hashlib.file_digest(stream, "sha256").hexdigest()
+        status = "queued" if file else "waiting"
+        entered = now().isoformat(timespec="microseconds")
+        with self.db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            if identifier is not None:
+                existing = db.execute("SELECT * FROM sources WHERE id=?", (identifier,)).fetchone()
+                if existing is None or existing["url"] != url:
+                    raise ValueError("Источник уже изменился. Откройте его снова.")
+            else:
+                existing = db.execute("SELECT * FROM sources WHERE source_key=?", (key,)).fetchone()
+            if existing and existing["status"] == "waiting" and existing["kind"] == "live" and kind == "vod":
+                db.execute("UPDATE sources SET url=?,title=?,kind=? WHERE id=?",
+                           (url, title or existing["title"], kind, existing["id"]))
+                return
+            if existing and (existing["status"] != "waiting" or not file or existing["lang"] != lang):
+                raise ValueError("Этот источник уже есть или указан другой язык.")
+            if fingerprint and db.execute("SELECT 1 FROM sources WHERE fingerprint=?", (fingerprint,)).fetchone():
+                raise ValueError("Этот файл уже был добавлен.")
+            try:
+                if existing:
+                    db.execute("""UPDATE sources SET rel_file=?, fingerprint=?, status=?, mark=?, title=?,queued_at=?
+                                  WHERE id=?""", (file, fingerprint, status, mark, title or Path(file).stem,
+                                                 entered, existing["id"]))
+                else:
+                    db.execute("""INSERT INTO sources(lang,title,url,source_key,rel_file,fingerprint,mark,status,created,kind,queued_at)
+                                  VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+                               (lang, title or (Path(file).stem if file else urlsplit(url).netloc), url,
+                                key or None, file or None, fingerprint, mark, status, entered, kind, entered if file else None))
+            except sqlite3.IntegrityError:
+                raise ValueError("Этот файл или источник уже был добавлен.") from None
+
+    def receive_video(self, stream, size, metadata):
+        lang = language(metadata)
+        name = text_field(metadata, "name", 240)
+        if not name or Path(name).name != name or Path(name).suffix.lower() not in MEDIA:
+            raise ValueError("Допустимые форматы: MP4, MOV, MKV, WebM и TS.")
+        if not 0 < size <= 2 * 1024 ** 3:
+            raise ValueError("Допустимый размер видео — до 2 ГиБ.")
+        folder = self.input / lang
+        with NamedTemporaryFile(dir=folder, prefix=".upload-", suffix=".part", delete=False) as writer:
+            temporary = Path(writer.name)
+            digest = hashlib.sha256()
+            try:
+                remaining = size
+                while remaining:
+                    chunk = stream.read(min(remaining, 1024 * 1024))
+                    if not chunk:
+                        raise ValueError("Загрузка прервалась. Повторите её.")
+                    writer.write(chunk)
+                    digest.update(chunk)
+                    remaining -= len(chunk)
+                writer.flush()
+                os.fsync(writer.fileno())
+                # Preserve the original name when possible. Never overwrite an existing video.
+                with self.inbox_lock:
+                    destination = folder / name
+                    if destination.exists() or destination.is_symlink():
+                        destination = folder / (secrets.token_hex(5) + Path(name).suffix.lower())
+                    os.utime(temporary, None)
+                    os.link(temporary, destination)
+                    try:
+                        self.add_source({**metadata, "file": destination.name}, file_digest=digest.hexdigest())
+                    except Exception:
+                        destination.unlink()
+                        raise
+            finally:
+                temporary.unlink(missing_ok=True)
+        return {"name": destination.name}
+
+    def add_account(self, data):
+        lang = language(data)
+        platform = text_field(data, "platform", 15)
+        name, target = text_field(data, "name", 100), text_field(data, "target", 100)
+        route = text_field(data, "route", 10)
+        identifier = data.get("id")
+        if identifier is not None and type(identifier) is not int:
+            raise ValueError("Неверный ID аккаунта.")
+        if platform not in transport.API_HOSTS or route not in transport.REGIONS or not name:
+            raise ValueError("Заполните название, площадку и маршрут.")
+        if platform == "YouTube" and not CHANNEL_RE.fullmatch(target):
+            raise ValueError("Для YouTube нужен ID канала, начинающийся с UC.")
+        if platform != "YouTube":
+            if not re.fullmatch(r"@?[a-zA-Z0-9_.]{1,80}", target):
+                raise ValueError("Укажите имя аккаунта.")
+            target = "@" + target.lstrip("@").lower()
+        with self.db() as db:
+            try:
+                db.execute("BEGIN IMMEDIATE")
+                if identifier is None:
+                    duplicate = db.execute("""SELECT 1 FROM accounts WHERE platform=? AND
+                        (target=? OR (? <> 'YouTube' AND lower(ltrim(target, '@'))=?))""",
+                                           (platform, target, platform, target.lstrip("@"))).fetchone()
+                    if duplicate:
+                        raise ValueError("Этот канал уже добавлен. Откройте его карточку.")
+                    db.execute("INSERT INTO accounts(lang,platform,name,target,route) VALUES (?,?,?,?,?)",
+                               (lang, platform, name, target, route))
+                else:
+                    old = db.execute("SELECT * FROM accounts WHERE id=?", (identifier,)).fetchone()
+                    if not old or old["lang"] != lang or old["platform"] != platform:
+                        raise ValueError("Аккаунт не найден.")
+                    same_target = (old["target"] == target or platform != "YouTube" and
+                                   old["target"].lstrip("@").casefold() == target.lstrip("@"))
+                    if not same_target:
+                        raise ValueError("Чтобы подключить другой канал, добавьте новую карточку.")
+                    if old["route"] != route:
+                        busy = db.execute("""SELECT 1 FROM queue WHERE account_id=? AND
+                                          status IN ('checking','sending','unknown')""", (identifier,)).fetchone()
+                        if busy:
+                            raise ValueError("Сначала разберите активные задания аккаунта.")
+                        db.execute("UPDATE accounts SET name=?,route=?,auto=0 WHERE id=?", (name, route, identifier))
+                        db.execute("""UPDATE queue SET status='review',detail='' WHERE account_id=?
+                                   AND status IN ('scheduled','route_wait')""", (identifier,))
+                        db.execute("DELETE FROM account_metrics WHERE account_id=?", (identifier,))
+                    else:
+                        db.execute("UPDATE accounts SET name=? WHERE id=?", (name, identifier))
+                self.populate(db)
+            except sqlite3.IntegrityError:
+                raise ValueError("Этот канал уже добавлен.") from None
+
+    def get_account(self, identifier):
+        with self.db() as db:
+            account = db.execute("SELECT * FROM accounts WHERE id=?", (identifier,)).fetchone()
+        if not account:
+            raise ValueError("Аккаунт не найден.")
+        return dict(account)
+
+    def change_setting(self, name, value):
+        if name not in ("scan", "paused") or type(value) is not bool:
+            raise ValueError("Некорректная настройка.")
+        with self.db() as db:
+            db.execute("UPDATE settings SET value=? WHERE name=?", (int(value), name))
+
+    def auto_account(self, identifier, enabled):
+        account = self.get_account(identifier)
+        if type(enabled) is not bool:
+            raise ValueError("Некорректная настройка.")
+        if enabled:
+            if account["platform"] != "YouTube" or not account["refresh_token"] or not self.uploads_enabled():
+                raise ValueError("Сначала подключите YouTube и включите отправку на сервере.")
+            transport.prepare_upload(account)
+        with self.db() as db:
+            current = db.execute("""UPDATE accounts SET auto=? WHERE id=? AND target=? AND route=?
+                AND refresh_token IS ?""",
+                                 (int(enabled), identifier, account["target"], account["route"], account["refresh_token"]))
+            if not current.rowcount:
+                raise ValueError("Настройки аккаунта изменились. Повторите действие.")
+            if not enabled:
+                db.execute("UPDATE queue SET status='review',detail='' WHERE account_id=? AND status IN ('scheduled','route_wait')", (identifier,))
+
+    def scan(self):
+        with self.db() as db:
+            if not db.execute("SELECT value FROM settings WHERE name='scan'").fetchone()[0]:
+                return
+            known = {(r["lang"], r["rel_file"]) for r in db.execute("SELECT lang,rel_file FROM sources WHERE rel_file IS NOT NULL")}
+        for lang, files in self.available_files().items():
+            for file in files:
+                if (lang, file) in known:
+                    continue
+                try:
+                    path = self.media_file(lang, file)
+                    stat = path.stat()
+                    observed = (stat.st_size, stat.st_mtime_ns)
+                    if time.time() - stat.st_mtime < 5 or self.scanned.get((lang, file)) == observed:
+                        continue
+                    self.scanned[lang, file] = observed
+                    with self.inbox_lock:
+                        self.add_source({"lang": lang, "file": file})
+                except (OSError, ValueError):
+                    continue
+
+    def search(self, live_only=False):
+        if not discovery.configured():
+            return
+        with self.db() as db:
+            if not db.execute("SELECT value FROM settings WHERE name='scan'").fetchone()[0]:
+                return
+            count = db.execute("SELECT count(*) FROM sources WHERE status='waiting'").fetchone()[0]
+        if count >= 100:
+            self.search_status = "Лимит кандидатов. Уберите лишние источники."
+            return
+        saved, errors = 0, []
+        feeds = [] if live_only else [discovery.youtube(lang, code) for lang, code in LANGS.items()]
+        feeds.append(discovery.twitch(LANGS, live_only=live_only))
+        for feed in feeds:
+            try:
+                for candidate in feed:
+                    try:
+                        self.add_source(candidate, key_override=candidate.get("key"))
+                        saved += 1
+                    except ValueError:
+                        pass
+                    if count + saved >= 100:
+                        break
+            except (transport.ConnectionProblem, ValueError) as error:
+                errors.append(str(error))
+            if count + saved >= 100:
+                break
+        if errors or saved or not live_only:
+            self.search_status = " · ".join(errors) if errors else f"Найдено новых: {saved}"
+
+    def dismiss_source(self, identifier):
+        with self.db() as db:
+            db.execute("UPDATE sources SET status='dismissed' WHERE id=? AND status='waiting'", (identifier,))
+
+    def edit_one(self):
+        with self.db() as db:
+            source = db.execute("SELECT * FROM sources WHERE status='queued' ORDER BY queued_at,id LIMIT 1").fetchone()
+            if source is None:
+                return
+            db.execute("UPDATE sources SET status='editing' WHERE id=?", (source["id"],))
+        dest = self.output / f"source-{source['id']}"
+        try:
+            path = self.media_file(source["lang"], source["rel_file"])
+            with path.open("rb") as stream:
+                if hashlib.file_digest(stream, "sha256").hexdigest() != source["fingerprint"]:
+                    raise ValueError("Файл изменился после добавления.")
+            cmd = [sys.executable, str(HERE.parent / "clips.py"), str(path), "--output", str(dest),
+                   "--topic", "GTA 6", "--layout", "crop", "--count", "3", "--seconds", "35"]
+            if source["url"]:
+                cmd.extend(("--source-url", source["url"]))
+            if source["mark"] is not None:
+                cmd.extend(("--at", str(source["mark"])))
+            if os.environ.get("STREAMCUT_TRANSCRIBE") == "1":
+                cmd.extend(("--transcribe", "--burn-captions"))
+            manifest = dest / "manifest.json"
+            if not manifest.exists():
+                run = subprocess.run(cmd, cwd=HERE.parent, capture_output=True, text=True, timeout=7200)
+                if run.returncode:
+                    raise ValueError(run.stderr.strip()[-650:] or "Ошибка монтажа.")
+            clips = json.loads(manifest.read_text())["clips"]
+            with self.db() as db:
+                for index, clip in enumerate(clips, 1):
+                    filename = (dest / clip["video"]).resolve()
+                    if not filename.is_relative_to(dest) or not filename.is_file():
+                        raise ValueError("В экспорте отсутствует файл клипа.")
+                    detected = clip.get("speech_language") or {}
+                    lang = source["lang"]
+                    verified = (detected.get("code") == LANGS[lang] and
+                                detected.get("confidence", 0) >= 0.90)
+                    title = {"EN": f"GTA 6 • Stream Highlight #{index}",
+                             "ESP": f"GTA 6 • Momento del directo #{index}"}.get(lang, clip["title"])
+                    db.execute("INSERT INTO clips(source_id,lang,title,relative_path,verified) VALUES (?,?,?,?,?)",
+                               (source["id"], lang, title, str(filename.relative_to(self.output)), int(verified)))
+                db.execute("UPDATE sources SET status=?, detail=? WHERE id=?",
+                           ("ready" if clips else "empty", "" if clips else "Добавьте источник с таймкодом.",
+                            source["id"]))
+                self.populate(db)
+        except (ValueError, OSError, subprocess.TimeoutExpired, KeyError) as error:
+            with self.db() as db:
+                db.execute("UPDATE sources SET status='failed', detail=? WHERE id=?",
+                           (str(error)[:650], source["id"]))
+
+    def populate(self, db):
+        choices = {}
+        accounts = db.execute("""SELECT c.id AS clip_id, c.lang, c.verified, a.id AS account_id,
+            a.auto, a.platform, a.refresh_token IS NOT NULL AS connected, h.state AS route_state
+            FROM clips c JOIN accounts a ON a.lang=c.lang
+            LEFT JOIN route_health h ON h.route=a.route AND h.platform=a.platform
+            WHERE NOT EXISTS (SELECT 1 FROM queue q JOIN accounts existing ON existing.id=q.account_id
+                               WHERE q.clip_id=c.id AND existing.platform=a.platform)
+            ORDER BY c.id, a.platform, a.id""")
+        for account in accounts:
+            choices.setdefault((account["clip_id"], account["platform"]), []).append(account)
+        instant = now()
+        for (clip_id, platform), options in choices.items():
+            ranked = []
+            for account in options:
+                automatic = (platform == "YouTube" and account["auto"] and account["connected"]
+                             and account["verified"] and self.uploads_enabled())
+                slot = self.next_slot(db, account["account_id"], account["lang"], instant)
+                on_hold = account["route_state"] in ("failed", "unconfigured")
+                ranked.append((not automatic, on_hold if automatic else False, slot, account["account_id"]))
+            review, held, slot, account_id = min(ranked)
+            state = "review" if review else ("route_wait" if held else "scheduled")
+            db.execute("INSERT INTO queue(clip_id,account_id,at,status) VALUES (?,?,?,?)",
+                       (clip_id, account_id, slot, state))
+
+    @staticmethod
+    def next_slot(db, account, lang, after, exclude=None):
+        reserved = [datetime.fromisoformat(r["at"]) for r in db.execute(
+            "SELECT at FROM queue WHERE account_id=? AND status!='cancelled' AND id IS NOT ?",
+            (account, exclude))]
+        return iso(schedule.available_slot(after, lang, reserved))
+
+    def queue_action(self, data):
+        identifier, action = data.get("id"), data.get("action")
+        with self.db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            job = db.execute("""SELECT q.*, a.lang, a.platform, a.refresh_token IS NOT NULL AS connected
+                              FROM queue q JOIN accounts a ON a.id=q.account_id WHERE q.id=?""",
+                             (identifier,)).fetchone()
+            if not job or job["status"] in ("sending", "checking", "unknown", "uploaded", "cancelled"):
+                raise ValueError("Это задание нельзя изменить.")
+            if action == "cancel":
+                db.execute("UPDATE queue SET status='cancelled' WHERE id=?", (identifier,))
+                return
+            planned = schedule.local_time(text_field(data, "at", 16), job["lang"])
+            if planned <= now():
+                raise ValueError("Выберите время в будущем.")
+            start, end = schedule.civil_day(planned, job["lang"])
+            total = db.execute("""SELECT count(*) FROM queue WHERE account_id=? AND id!=?
+                AND status!='cancelled' AND at>=? AND at<?""",
+                               (job["account_id"], identifier, iso(start), iso(end))).fetchone()[0]
+            if total >= schedule.DAY_LIMIT:
+                raise ValueError("На эти сутки уже запланировано 10 роликов для аккаунта.")
+            if action == "send":
+                if job["platform"] != "YouTube" or not job["connected"] or not self.uploads_enabled():
+                    raise ValueError("Отправка доступна после подключения YouTube и включения на сервере.")
+                state = "scheduled"
+            elif action == "save":
+                state = job["status"] if job["status"] in ("scheduled", "route_wait") else "review"
+            else:
+                raise ValueError("Неизвестное действие.")
+            db.execute("UPDATE queue SET at=?,status=?,detail='' WHERE id=?", (iso(planned), state, identifier))
+
+    @staticmethod
+    def connection_snapshot(rows):
+        collected = {(row["route"], row["platform"]): row for row in rows}
+        threshold = iso(now() - timedelta(minutes=3))
+        results = []
+        for route in ("RU", "US", "ES", "server"):
+            for platform in transport.API_HOSTS:
+                row = collected.get((route, platform))
+                if not transport.route_available(route):
+                    row = dict(route=route, platform=platform, state="unconfigured",
+                               country=None, detail="Маршрут не настроен.", checked_at=None)
+                elif not row:
+                    row = dict(route=route, platform=platform, state="unchecked",
+                               country=None, detail="Проверки ещё не было.", checked_at=None)
+                elif row["checked_at"] < threshold:
+                    row = {**row, "state": "stale"}
+                results.append(row)
+        return results
+
+    def record_connection(self, result, checking_id=None):
+        route, platform = result["route"], result["platform"]
+        with self.db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            saved = db.execute("""INSERT INTO route_health(route,platform,state,country,detail,checked_at)
+                VALUES (:route,:platform,:state,:country,:detail,:checked_at)
+                ON CONFLICT(route,platform) DO UPDATE SET state=excluded.state,country=excluded.country,
+                detail=excluded.detail,checked_at=excluded.checked_at
+                WHERE excluded.checked_at>=route_health.checked_at""", result)
+            if not saved.rowcount:
+                if checking_id is not None:
+                    db.execute("UPDATE queue SET status='scheduled' WHERE id=? AND status='checking'", (checking_id,))
+                return
+            if result["state"] != "ok":
+                db.execute("""UPDATE queue SET status='route_wait',detail=? WHERE status='scheduled'
+                    AND account_id IN (SELECT id FROM accounts WHERE route=? AND platform=?)""",
+                           (result["detail"], route, platform))
+                if checking_id is not None:
+                    db.execute("UPDATE queue SET status='route_wait',detail=? WHERE id=? AND status='checking'",
+                               (result["detail"], checking_id))
+                return
+            recovered = db.execute("""SELECT q.id,q.account_id,q.at,a.lang FROM queue q
+                                      JOIN accounts a ON q.account_id=a.id
+                                      WHERE a.route=? AND a.platform=? AND q.status='route_wait'
+                                      ORDER BY q.at,q.id""", (route, platform)).fetchall()
+            instant = now()
+            for row in recovered:
+                slot = row["at"]
+                if datetime.fromisoformat(slot) <= instant:
+                    slot = self.next_slot(db, row["account_id"], row["lang"], instant, row["id"])
+                db.execute("UPDATE queue SET status='scheduled',at=?,detail='' WHERE id=?", (slot, row["id"]))
+
+    def check_connection(self, route, platform):
+        if route not in transport.REGIONS or platform not in transport.API_HOSTS:
+            raise ValueError("Выберите маршрут и площадку.")
+        result = connections.observe(route, platform)
+        self.record_connection(result)
+        return result
+
+    def monitor_connections(self):
+        routes = {(route, platform) for route in transport.REGIONS - {"server"} if transport.route_available(route)
+                  for platform in transport.API_HOSTS}
+        with self.db() as db:
+            routes.update(tuple(row) for row in db.execute("SELECT DISTINCT route,platform FROM accounts"))
+        if routes:
+            with ThreadPoolExecutor(max_workers=6) as pool:
+                for result in pool.map(lambda pair: connections.observe(*pair), sorted(routes)):
+                    self.record_connection(result)
+
+    def refresh_metrics(self):
+        with self.db() as db:
+            records = db.execute("""SELECT a.*,m.payload FROM accounts a
+                LEFT JOIN account_metrics m ON m.account_id=a.id""").fetchall()
+        threshold = iso(now() - timedelta(hours=6))
+        for record in records:
+            account = dict(record)
+            old = json.loads(account.pop("payload") or "{}")
+            if old.get("checked_at", "") >= threshold:
+                continue
+            try:
+                stats = metrics.read(account)
+            except transport.ConnectionProblem as error:
+                stats = {**old, "note": "Последнее обновление не удалось. " + str(error)}
+            if stats is not None:
+                stats["checked_at"] = iso(now())
+                with self.db() as db:
+                    current = db.execute("SELECT * FROM accounts WHERE id=?", (account["id"],)).fetchone()
+                    if not current or dict(current) != account:
+                        continue
+                    db.execute("INSERT OR REPLACE INTO account_metrics(account_id,payload) VALUES (?,?)",
+                               (account["id"], json.dumps(stats, ensure_ascii=False)))
+
+    def publish_one(self):
+        if not self.uploads_enabled():
+            return
+        started = now()
+        with self.db() as db:
+            if db.execute("SELECT value FROM settings WHERE name='paused'").fetchone()[0]:
+                return
+            job = db.execute("""SELECT q.id, q.account_id, c.title, c.lang, c.relative_path
+                                FROM queue q JOIN clips c ON c.id=q.clip_id JOIN accounts a ON a.id=q.account_id
+                                WHERE q.status='scheduled' AND q.at<=? AND a.platform='YouTube'
+                                AND (SELECT count(*) FROM queue past WHERE past.account_id=q.account_id
+                                     AND past.sent_at>?) < 10
+                                AND NOT EXISTS (SELECT 1 FROM queue recent
+                                    WHERE recent.account_id=q.account_id AND recent.sent_at>?)
+                                ORDER BY q.at LIMIT 1""",
+                             (iso(started), iso(started - timedelta(hours=24)),
+                              iso(started - timedelta(minutes=30)))).fetchone()
+            if not job:
+                return
+            cursor = db.execute("UPDATE queue SET status='checking' WHERE id=? AND status='scheduled'", (job["id"],))
+            if not cursor.rowcount:
+                return
+        try:
+            account = self.get_account(job["account_id"])
+            path = (self.output / job["relative_path"]).resolve()
+            if not path.is_relative_to(self.output) or not path.is_file() or not account["refresh_token"]:
+                raise ValueError("Клип или подключение аккаунта недоступны.")
+            token = transport.prepare_upload(account)
+        except transport.RouteProblem as error:
+            self.record_connection(dict(route=account["route"], platform=account["platform"], state="failed",
+                                        country=None, detail=str(error), checked_at=iso(now())), job["id"])
+            return
+        except (transport.ConnectionProblem, ValueError, OSError) as error:
+            with self.db() as db:
+                db.execute("UPDATE queue SET status='blocked',detail=? WHERE id=?", (str(error), job["id"]))
+            return
+        with self.db() as db:
+            db.execute("BEGIN IMMEDIATE")
+            fresh = db.execute("SELECT * FROM accounts WHERE id=?", (account["id"],)).fetchone()
+            paused = db.execute("SELECT value FROM settings WHERE name='paused'").fetchone()[0]
+            if fresh is None or dict(fresh) != account:
+                db.execute("UPDATE queue SET status='review',detail=? WHERE id=?",
+                           ("Во время проверки настройки изменились.", job["id"]))
+                return
+            if paused:
+                db.execute("UPDATE queue SET status='scheduled' WHERE id=?", (job["id"],))
+                return
+            latest = db.execute("""SELECT state, detail FROM route_health WHERE route=? AND platform=?
+                                AND checked_at>=?""", (account["route"], account["platform"], iso(started))).fetchone()
+            if latest and latest["state"] != "ok":
+                db.execute("UPDATE queue SET status='route_wait',detail=? WHERE id=?", (latest["detail"], job["id"]))
+                return
+            db.execute("UPDATE queue SET status='sending',sent_at=? WHERE id=?", (iso(now()), job["id"]))
+        try:
+            external = transport.upload_private(account["route"], token, job["title"], job["lang"], path)
+        except (transport.ConnectionProblem, OSError):
+            with self.db() as db:
+                db.execute("UPDATE queue SET status='unknown',detail=? WHERE id=?",
+                           ("Проверьте YouTube Studio перед повтором.", job["id"]))
+            return
+        with self.db() as db:
+            db.execute("UPDATE queue SET status='uploaded',external_id=?,detail='' WHERE id=?", (external, job["id"]))
+
+    def loop(self, operation, interval):
+        while not self.stop.is_set():
+            try:
+                operation()
+            except Exception:
+                logging.exception("Фоновое задание остановлено ошибкой.")
+            self.stop.wait(interval)
+
+    def start_oauth(self, identifier, origin):
+        account = self.get_account(identifier)
+        if account["platform"] != "YouTube" or not transport.youtube_configured():
+            raise ValueError("На сервере ещё не настроен OAuth YouTube.")
+        transport.check_route(account["route"], "YouTube")
+        state, verifier = secrets.token_urlsafe(24), secrets.token_urlsafe(64)
+        self.pending_auth = {key: val for key, val in self.pending_auth.items() if val[0] > time.monotonic()}
+        redirect = f"{origin}/oauth/youtube"
+        self.pending_auth[state] = (time.monotonic() + 600, identifier, account["target"], account["route"],
+                                    verifier, redirect)
+        challenge = base64.urlsafe_b64encode(hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+        params = urlencode({"client_id": os.environ["STREAMCUT_GOOGLE_CLIENT_ID"], "redirect_uri": redirect,
+                            "response_type": "code", "scope": transport.YOUTUBE_SCOPES, "state": state,
+                            "access_type": "offline", "prompt": "consent select_account",
+                            "code_challenge": challenge, "code_challenge_method": "S256"})
+        return "https://accounts.google.com/o/oauth2/v2/auth?" + params
+
+    def finish_oauth(self, params):
+        state = params.get("state", [""])[0]
+        code = params.get("code", [""])[0]
+        stored = self.pending_auth.pop(state, None)
+        if not code or not stored or time.monotonic() >= stored[0]:
+            raise ValueError("Сессия подключения истекла или доступ отменён.")
+        _, identifier, target, route, verifier, redirect = stored
+        account = self.get_account(identifier)
+        if (account["target"], account["route"]) != (target, route):
+            raise ValueError("Настройки канала изменились. Начните подключение снова.")
+        transport.check_route(route, "YouTube")
+        tokens = transport.token_request(route, grant_type="authorization_code", code=code,
+                                         code_verifier=verifier, redirect_uri=redirect)
+        transport.confirm_channel(route, tokens["access_token"], target)
+        token = tokens.get("refresh_token")
+        if not token:
+            raise ValueError("Google не выдал доступ для фоновой работы.")
+        with self.db() as db:
+            cursor = db.execute("""UPDATE accounts SET refresh_token=?,auto=0
+                 WHERE id=? AND target=? AND route=?""", (token, identifier, target, route))
+            if not cursor.rowcount:
+                raise ValueError("Настройки канала изменились. Начните подключение снова.")
+            db.execute("DELETE FROM account_metrics WHERE account_id=?", (identifier,))
+
+
+class Handler(SimpleHTTPRequestHandler):
+    MAX_BODY = 16 * 1024
+
+    def log_message(self, *_):
+        # OAuth callback query parameters contain authorization codes.
+        pass
+
+    def end_headers(self):
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("Content-Security-Policy",
+                         "default-src 'self'; object-src 'none'; frame-ancestors 'none'; base-uri 'none'")
+        super().end_headers()
+
+    def send_json(self, value, status=200):
+        body = json.dumps(value, ensure_ascii=False).encode()
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def is_local(self):
+        return self.headers.get("Host") == f"127.0.0.1:{self.server.server_port}"
+
+    def do_HEAD(self):
+        self.send_error(405)
+
+    def do_GET(self):
+        if not self.is_local():
+            self.send_error(403)
+            return
+        url = urlsplit(self.path)
+        if url.path == "/healthz":
+            self.send_json({"ok": True})
+            return
+        if url.path == "/api/state":
+            self.send_json(self.server.studio.snapshot())
+            return
+        if url.path == "/oauth/youtube":
+            try:
+                self.server.studio.finish_oauth(parse_qs(url.query))
+            except (ValueError, transport.ConnectionProblem) as error:
+                self.send_response(303)
+                self.send_header("Location", "/?oauth=" + urlencode({"": str(error)})[1:] + "#accounts")
+                self.end_headers()
+                return
+            self.send_response(303)
+            self.send_header("Location", "/?oauth=ok#accounts")
+            self.end_headers()
+            return
+        if match := re.fullmatch(r"/media/([0-9]+)", url.path):
+            self.send_media(int(match[1]))
+            return
+        if url.path == "/":
+            self.path = "/index.html"
+        elif not re.fullmatch(r"/(?:index\.html|app\.js|core\.mjs|styles\.css|assets/[A-Za-z0-9_.-]+)", url.path):
+            self.send_error(404)
+            return
+        super().do_GET()
+
+    def send_media(self, clip_id):
+        studio = self.server.studio
+        with studio.db() as db:
+            row = db.execute("SELECT relative_path FROM clips WHERE id=?", (clip_id,)).fetchone()
+        if not row:
+            self.send_error(404)
+            return
+        path = (studio.output / row["relative_path"]).resolve()
+        if not path.is_relative_to(studio.output) or not path.is_file():
+            self.send_error(404)
+            return
+        with path.open("rb") as stream:
+            size = path.stat().st_size
+            start, end, partial = 0, size - 1, False
+            if header := self.headers.get("Range"):
+                match = re.fullmatch(r"bytes=([0-9]{1,16})-([0-9]{0,16})", header)
+                if not match or int(match[1]) >= size or match[2] and int(match[2]) < int(match[1]):
+                    self.send_response(416)
+                    self.send_header("Content-Range", f"bytes */{size}")
+                    self.end_headers()
+                    return
+                start = int(match[1])
+                end = min(end, int(match[2])) if match[2] else end
+                partial = True
+            self.send_response(206 if partial else 200)
+            self.send_header("Content-Type", "video/mp4")
+            self.send_header("Content-Length", str(end - start + 1))
+            self.send_header("Accept-Ranges", "bytes")
+            if partial:
+                self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+            self.end_headers()
+            stream.seek(start)
+            remaining = end - start + 1
+            try:
+                while remaining:
+                    data = stream.read(min(remaining, 256 * 1024))
+                    if not data:
+                        break
+                    self.wfile.write(data)
+                    remaining -= len(data)
+            except (BrokenPipeError, ConnectionResetError):
+                return
+
+    def do_POST(self):
+        origin = f"http://127.0.0.1:{self.server.server_port}"
+        if not self.is_local() or self.headers.get("Origin") != origin:
+            self.send_json({"error": "Откройте панель по локальному адресу сервиса."}, 403)
+            return
+        studio = self.server.studio
+        try:
+            size = int(self.headers.get("Content-Length", "0"))
+            url = urlsplit(self.path)
+            if url.path == "/api/inbox":
+                if len(url.query) > 8000 or self.headers.get_content_type() != "application/octet-stream":
+                    raise ValueError("Некорректная загрузка.")
+                fields = {key: values[0] for key, values in
+                          parse_qs(url.query, max_num_fields=8).items()}
+                for key in ("mark", "id"):
+                    if key in fields:
+                        fields[key] = int(fields[key])
+                self.connection.settimeout(45)
+                self.send_json(studio.receive_video(self.rfile, size, fields), 201)
+                return
+            if not 0 < size <= self.MAX_BODY or self.headers.get_content_type() != "application/json":
+                raise ValueError("Некорректное тело запроса.")
+            payload = json.loads(self.rfile.read(size))
+            if not isinstance(payload, dict):
+                raise ValueError("Некорректное тело запроса.")
+            result = {}
+            if self.path == "/api/sources":
+                studio.add_source(payload)
+            elif self.path == "/api/sources/dismiss":
+                studio.dismiss_source(payload.get("id"))
+            elif self.path == "/api/accounts":
+                studio.add_account(payload)
+            elif self.path == "/api/check":
+                result = studio.check_connection(text_field(payload, "route", 10), text_field(payload, "platform", 12))
+            elif self.path == "/api/oauth":
+                result = {"url": studio.start_oauth(payload.get("id"), origin)}
+            elif self.path == "/api/auto":
+                studio.auto_account(payload.get("id"), payload.get("enabled"))
+            elif self.path == "/api/settings":
+                studio.change_setting(payload.get("name"), payload.get("enabled"))
+            elif self.path == "/api/queue":
+                studio.queue_action(payload)
+            else:
+                self.send_json({"error": "Действие не найдено."}, 404)
+                return
+            self.send_json(result)
+        except (ValueError, transport.ConnectionProblem) as error:
+            self.send_json({"error": str(error)}, 400)
+        except (OSError, sqlite3.Error, TypeError):
+            logging.exception("Сбой обработки запроса.")
+            self.send_json({"error": "Ошибка сервиса. Проверьте журнал."}, 500)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--data", type=Path, default=Path.home() / ".streamcut")
+    args = parser.parse_args()
+    os.umask(0o077)
+
+    def terminate(_signal, _frame):
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, terminate)
+    studio = Studio(args.data)
+    try:
+        with ThreadingHTTPServer(("127.0.0.1", args.port), Handler) as server:
+            server.studio = studio
+            server.RequestHandlerClass.extensions_map = {**Handler.extensions_map, ".mjs": "text/javascript"}
+
+            def handler(*args, **kwargs):
+                return Handler(*args, directory=str(HERE / "dist"), **kwargs)
+
+            server.RequestHandlerClass = handler
+
+            def edit_cycle():
+                studio.scan()
+                studio.edit_one()
+
+            Thread(target=studio.loop, args=(edit_cycle, 4), daemon=True).start()
+            Thread(target=studio.loop, args=(studio.publish_one, 8), daemon=True).start()
+            Thread(target=studio.loop, args=(studio.search, 6 * 3600), daemon=True).start()
+            Thread(target=studio.loop, args=(lambda: studio.search(live_only=True), 15 * 60), daemon=True).start()
+            Thread(target=studio.loop, args=(studio.monitor_connections, 60), daemon=True).start()
+            Thread(target=studio.loop, args=(studio.refresh_metrics, 60), daemon=True).start()
+            print(f"Streamcut: http://127.0.0.1:{server.server_port}/", flush=True)
+            print(f"Входящие файлы: {studio.input}", flush=True)
+            server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    finally:
+        studio.stop.set()
+        studio.close()
+
+
+if __name__ == "__main__":
+    main()
