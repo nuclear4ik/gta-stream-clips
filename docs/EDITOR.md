@@ -60,6 +60,19 @@ python3 clips.py "stream.mp4" --output "result" --count 3 --seconds 35 --creator
 python3 clips.py "stream.mp4" --output "manual" --at 12:40 --at 01:07:16 --seconds 30
 ```
 
+Для точной нарезки передайте `--ranges moments.json`. Файл содержит начало и конец в секундах исходника, округлённых до миллисекунд, и необязательный заголовок для каждого фрагмента.
+
+```json
+{"moments":[{"start_seconds":12.5,"end_seconds":30.0,"headline":"Погоня через весь город"}]}
+```
+
+```sh
+python3 clips.py "stream.mp4" --output "selected" --ranges moments.json \
+  --layout split --facecam '74%,70%,25%,29%' --srt "stream.srt" --burn-captions --require-speech
+```
+
+Этот режим сохраняет заданные границы, вырезает синхронный исходный звук и переносит реплики SRT на начало клипа. Он несовместим с `--at` и монтажными хуками.
+
 ## Субтитры и заголовки с цитатами
 
 Если у вас есть готовый SRT в UTF‑8 с таймкодами **исходного видео**, можно обойтись без модели:

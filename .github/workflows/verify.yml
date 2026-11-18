@@ -42,6 +42,13 @@ jobs:
                   sys.exit("Include «Что изменилось», «Почему», «Проверки» in each commit body.")
           PY
 
+      - name: Ensure FFmpeg is available for rendering tests
+        run: |
+          if ! command -v ffmpeg >/dev/null || ! command -v ffprobe >/dev/null; then
+            sudo apt-get update -q
+            sudo apt-get install -y ffmpeg
+          fi
+
       - name: Verify video utilities
         id: media
         if: always()

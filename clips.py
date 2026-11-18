@@ -21,6 +21,8 @@ from editing import composition, get_crops, parse_crop, parse_focus, plan_edit
 SOUND_KEY = "lavfi.astats.Overall.RMS_level"
 MOTION_KEY = "lavfi.signalstats.YAVG"
 SECOND_PER_SAMPLE = 0.5
+MAX_RANGES = 100
+MAX_RANGES_BYTES = 64 * 1024
 FFMPEG = [
     "ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin",
     "-filter_threads", "2", "-filter_complex_threads", "2",
@@ -43,6 +45,7 @@ class Highlight:
     peak: float
     score: float | None
     cue: str
+    headline: str | None = None
 
 
 def execute(command, cwd=None):
@@ -120,6 +123,8 @@ def motion_levels(source, recording, crop):
 
 
 def find_highlights(source, recording, options, camera, game):
+    if options.ranges:
+        return read_ranges(options.ranges, recording.duration)
     if options.at:
         return select_highlights(
             [(at, None, "manual") for at in options.at], recording.duration, options
@@ -154,6 +159,38 @@ def find_highlights(source, recording, options, camera, game):
             candidates.append((index * SECOND_PER_SAMPLE, score, cue))
     candidates.sort(key=lambda item: (-item[1], item[0]))
     return select_highlights(candidates, recording.duration, options)
+
+
+def read_ranges(path, duration):
+    with path.open("rb") as stream:
+        raw = stream.read(MAX_RANGES_BYTES + 1)
+    if len(raw) > MAX_RANGES_BYTES:
+        raise ValueError("Файл --ranges должен занимать не более 64 КиБ.")
+    try:
+        data = json.loads(raw)
+    except (ValueError, RecursionError) as error:
+        raise ValueError("Не удалось прочитать JSON из --ranges.") from error
+    if (not isinstance(data, dict) or data.keys() != {"moments"} or
+            not isinstance(data["moments"], list) or not 1 <= len(data["moments"]) <= MAX_RANGES):
+        raise ValueError(f"В --ranges нужен список moments с 1–{MAX_RANGES} интервалами.")
+    highlights = []
+    required = {"start_seconds", "end_seconds"}
+    allowed = required | {"headline"}
+    for index, moment in enumerate(data["moments"], 1):
+        if not isinstance(moment, dict) or not required <= moment.keys() <= allowed:
+            raise ValueError(f"Интервал {index} должен содержать start_seconds и end_seconds. Поле headline необязательно.")
+        start, end = moment["start_seconds"], moment["end_seconds"]
+        if (type(start) not in (int, float) or type(end) not in (int, float) or
+                not 0 <= start < end <= duration):
+            raise ValueError(f"Интервал {index} должен иметь числовые границы внутри записи ({duration:g} с).")
+        start, end = round(start, 3), round(end, 3)
+        if not start < end <= duration:
+            raise ValueError(f"Интервал {index} должен умещаться в запись с точностью до миллисекунд.")
+        headline = None
+        if "headline" in moment:
+            headline = validate_headline(moment["headline"], f"поле headline в интервале {index}")
+        highlights.append(Highlight(start, end, (start + end) / 2, None, "manual", headline))
+    return highlights
 
 
 def select_highlights(candidates, duration, options):
@@ -305,7 +342,7 @@ def export(source, recording, highlights, options, camera, game, source_captions
                 )
             headline = (
                 choose_headline(
-                    options.headline, options.topic,
+                    item.headline or options.headline, options.topic,
                     [cue for cue in original_captions if item.start < cue.end and cue.start < item.end],
                     item.peak,
                 )
@@ -381,6 +418,13 @@ def parse_timestamp(raw):
         raise argparse.ArgumentTypeError("Формат отметки: секунды, ММ:СС или ЧЧ:ММ:СС.") from error
 
 
+def validate_headline(raw, label):
+    headline = plain_text(raw) if isinstance(raw, str) else ""
+    if not 3 <= len(headline_words(headline)) <= 5 or len(headline) > 50:
+        raise ValueError(f"Проверьте {label}. Требуется от 3 до 5 слов и до 50 символов.")
+    return headline
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Автоматический поиск и монтаж моментов из записи эфира.")
     parser.add_argument("source", type=Path, help="Локальный видеофайл")
@@ -391,7 +435,9 @@ def parse_args():
     parser.add_argument("--count", type=int, default=3, help="Максимум автоматически найденных клипов")
     parser.add_argument("--seconds", type=int, default=35, help="Желаемая длина клипа, от 5 до 60 секунд")
     parser.add_argument("--threshold", type=float, default=1.6, help="Порог поиска моментов")
-    parser.add_argument("--at", type=parse_timestamp, action="append", help="Ручная отметка момента, можно повторить")
+    selection = parser.add_mutually_exclusive_group()
+    selection.add_argument("--at", type=parse_timestamp, action="append", help="Ручная отметка момента, можно повторить")
+    selection.add_argument("--ranges", type=Path, help="JSON-файл с точными границами фрагментов в секундах")
     parser.add_argument("--width", type=int, choices=[720, 1080], default=1080, help="Ширина MP4")
     parser.add_argument("--layout", choices=["fit", "crop", "split"], help="Целый кадр, обрезка или две зоны без полей")
     parser.add_argument("--facecam", type=parse_crop, help="Вебкамера в исходнике: x,y,ширина,высота")
@@ -421,6 +467,8 @@ def parse_args():
         parser.error("--threshold должен быть положительным конечным числом.")
     if not 0.8 <= options.hook_seconds <= 3:
         parser.error("--hook-seconds должен быть от 0.8 до 3.")
+    if options.ranges and options.hook != "off":
+        parser.error("--ranges требует --hook off, чтобы сохранить точные границы фрагментов.")
     if options.burn_captions and not (options.transcribe or options.srt):
         parser.error("--burn-captions требует --transcribe или --srt.")
     if options.require_speech and not options.burn_captions:
@@ -431,9 +479,10 @@ def parse_args():
     if options.layout != "split" and any((options.headline, options.facecam_focus, options.gameplay_focus)):
         parser.error("Тема и точки кадрирования доступны в макете с --facecam.")
     if options.headline is not None:
-        options.headline = plain_text(options.headline)
-        if not 3 <= len(headline_words(options.headline)) <= 5 or len(options.headline) > 50:
-            parser.error("--headline: от 3 до 5 слов, до 50 символов.")
+        try:
+            options.headline = validate_headline(options.headline, "--headline")
+        except ValueError as error:
+            parser.error(str(error))
     if options.caption_y is not None and not 40 <= options.caption_y <= 80:
         parser.error("--caption-y должен быть от 40 до 80.")
     options.topic = " ".join(options.topic.split())
@@ -457,7 +506,7 @@ def main():
             raise ValueError("У исходника нет аудиодорожки со звуком реакции.")
         camera, game = get_crops(recording.width, recording.height, options.facecam, options.gameplay)
         source_captions = read_srt(options.srt) if options.srt else []
-        print("Подбираю фрагменты…", flush=True)
+        print("Проверяю интервалы…" if options.ranges else "Подбираю фрагменты…", flush=True)
         highlights = find_highlights(source, recording, options, camera, game)
         output = export(source, recording, highlights, options, camera, game, source_captions)
         if highlights:

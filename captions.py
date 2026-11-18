@@ -37,7 +37,11 @@ def parse_clock(groups):
 
 
 def read_srt(path):
-    source = path.read_text(encoding="utf-8-sig")
+    return parse_srt(path.read_text(encoding="utf-8-sig"))
+
+
+def parse_srt(source, *, split_phrases=True):
+    source = source.removeprefix("\ufeff").replace("\r\n", "\n").replace("\r", "\n")
     captions = []
     for block in re.split(r"\n\s*\n", source.strip()):
         lines = block.splitlines()
@@ -50,7 +54,10 @@ def read_srt(path):
         start, end = parse_clock(timing.groups()[:4]), parse_clock(timing.groups()[4:])
         text = plain_text(" ".join(lines[first_line + 1:]))
         if text and end > start:
-            captions.extend(make_phrases(start, end, text))
+            if split_phrases:
+                captions.extend(make_phrases(start, end, text))
+            else:
+                captions.append(Caption(start, end, text))
     return sorted(captions, key=lambda caption: (caption.start, caption.end))
 
 

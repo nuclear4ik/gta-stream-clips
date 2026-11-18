@@ -26,6 +26,7 @@ import connections
 import discovery
 import metrics
 import reaction
+import moment_model
 import regional
 import schedule
 import transport
@@ -97,7 +98,7 @@ CREATE TABLE IF NOT EXISTS sources (
     id INTEGER PRIMARY KEY, lang TEXT NOT NULL, title TEXT NOT NULL, url TEXT NOT NULL,
     source_key TEXT UNIQUE, rel_file TEXT, fingerprint TEXT UNIQUE, mark INTEGER,
     status TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '', created TEXT NOT NULL, kind TEXT, queued_at TEXT,
-    last_seen TEXT
+    last_seen TEXT, edit_profile TEXT
 );
 CREATE TABLE IF NOT EXISTS discovery_feeds (
     lang TEXT NOT NULL, provider TEXT NOT NULL, checked_at TEXT NOT NULL, payload TEXT NOT NULL,
@@ -154,13 +155,12 @@ class Studio:
         with self.db() as db:
             db.executescript(SCHEMA)
             self.migrate_accounts(db)
-            if "kind" not in {row["name"] for row in db.execute("PRAGMA table_info(sources)")}:
-                db.execute("ALTER TABLE sources ADD COLUMN kind TEXT")
-            if "queued_at" not in {row["name"] for row in db.execute("PRAGMA table_info(sources)")}:
-                db.execute("ALTER TABLE sources ADD COLUMN queued_at TEXT")
+            source_columns = {row["name"] for row in db.execute("PRAGMA table_info(sources)")}
+            for column in ("kind", "queued_at", "last_seen", "edit_profile"):
+                if column not in source_columns:
+                    db.execute(f"ALTER TABLE sources ADD COLUMN {column} TEXT")
+            if "queued_at" not in source_columns:
                 db.execute("UPDATE sources SET queued_at=created WHERE rel_file IS NOT NULL")
-            if "last_seen" not in {row["name"] for row in db.execute("PRAGMA table_info(sources)")}:
-                db.execute("ALTER TABLE sources ADD COLUMN last_seen TEXT")
             if "verified" not in {row["name"] for row in db.execute("PRAGMA table_info(clips)")}:
                 db.execute("ALTER TABLE clips ADD COLUMN verified INTEGER NOT NULL DEFAULT 0")
             db.execute("UPDATE sources SET status='queued' WHERE status='editing'")
@@ -222,7 +222,7 @@ class Studio:
     def snapshot(self):
         with self.db() as db:
             settings = {r["name"]: bool(r["value"]) for r in db.execute("SELECT * FROM settings")}
-            sources = [dict(row) for row in db.execute("""SELECT id, lang, title, url, rel_file,
+            sources = [dict(row) for row in db.execute("""SELECT id, lang, title, url, rel_file, mark,
                         status, detail, kind FROM sources WHERE status NOT IN ('dismissed','expired') ORDER BY id DESC LIMIT 100""")]
             roster, ranking_updated, _ = self.current_discovery(db, now())
             accounts = []
@@ -238,7 +238,8 @@ class Studio:
             queue_counts.update(dict(db.execute("""SELECT c.lang,count(DISTINCT c.id)
                FROM queue q JOIN clips c ON c.id=q.clip_id WHERE q.status NOT IN ('uploaded','cancelled')
                GROUP BY c.lang""").fetchall()))
-            clips = [dict(row) for row in db.execute("SELECT id, lang, title FROM clips ORDER BY id DESC LIMIT 100")]
+            clips = [dict(row) for row in db.execute(
+                "SELECT id, source_id, lang, title FROM clips ORDER BY id DESC LIMIT 100")]
             queue = [dict(row) for row in db.execute("""SELECT q.id, q.clip_id, q.at, q.status, q.detail,
                        q.external_id, c.title, c.lang, a.name AS account, a.platform
                        FROM queue q JOIN clips c ON c.id=q.clip_id JOIN accounts a ON a.id=q.account_id
@@ -255,21 +256,43 @@ class Studio:
     def uploads_enabled():
         return os.environ.get("STREAMCUT_YOUTUBE_UPLOAD") == "1"
 
-    def add_source(self, data, key_override=None, file_digest=None, discovered_at=None):
+    def get_source(self, identifier):
+        if type(identifier) is not int or not 1 <= identifier <= 2**63 - 1:
+            raise ValueError("Неверный источник.")
+        with self.db() as db:
+            source = db.execute("SELECT * FROM sources WHERE id=?", (identifier,)).fetchone()
+        if source is None:
+            raise ValueError("Источник не найден.")
+        return source
+
+    def source_edit(self, identifier):
+        profile = self.get_source(identifier)["edit_profile"]
+        return {"edit": json.loads(profile) if profile else None}
+
+    def add_source(self, data, key_override=None, file_digest=None, discovered_at=None, *, return_id=False):
+        identifier = data.get("id")
+        if identifier is not None:
+            current = self.get_source(identifier)
+            data = {"lang": current["lang"], "url": current["url"], "title": current["title"],
+                    "mark": current["mark"], **data}
         lang = language(data)
         url, key = source_url(text_field(data, "url", 2048))
         if key_override:
             key = key_override
         kind = data.get("kind") if data.get("kind") in ("live", "vod", "video") else None
-        identifier = data.get("id")
-        if identifier is not None and type(identifier) is not int:
-            raise ValueError("Неверный источник.")
         file = text_field(data, "file", 255)
         title = text_field(data, "title", 140)
         mark = data.get("mark")
         if mark is not None and (type(mark) is not int or not 0 <= mark <= 86400):
             raise ValueError("Таймкод задаётся в секундах, от 0 до 86400.")
-        if not (url or file):
+        prepare = data.get("prepare_upload", False)
+        if type(prepare) is not bool or (prepare and file):
+            raise ValueError("Некорректная подготовка загрузки.")
+        profile = reaction.normalize_profile(data["edit"]) if data.get("edit") is not None else None
+        encoded_profile = json.dumps(profile, ensure_ascii=False, sort_keys=True) if profile is not None else None
+        if profile and profile["mode"] != "auto":
+            mark = None
+        if not (url or file or prepare or identifier is not None):
             raise ValueError("Укажите ссылку или выберите входящий файл.")
         fingerprint = None
         if file:
@@ -285,7 +308,7 @@ class Studio:
             db.execute("BEGIN IMMEDIATE")
             if identifier is not None:
                 existing = db.execute("SELECT * FROM sources WHERE id=?", (identifier,)).fetchone()
-                if existing is None or existing["url"] != url:
+                if existing is None or existing["url"] != url or existing["lang"] != lang:
                     raise ValueError("Источник уже изменился. Откройте его снова.")
             else:
                 existing = db.execute("SELECT * FROM sources WHERE source_key=?", (key,)).fetchone()
@@ -308,23 +331,36 @@ class Studio:
                 db.execute("UPDATE sources SET url=?,title=?,kind=? WHERE id=?",
                            (url, title or existing["title"], kind, existing["id"]))
                 return False
+            if existing and not file and (prepare or profile is not None):
+                if (existing["lang"] != lang or existing["status"] not in
+                        ("waiting", "waiting_layout", "failed", "empty") or (prepare and existing["rel_file"])):
+                    raise ValueError("Редактирование этого источника сейчас недоступно.")
+                status = "queued" if existing["rel_file"] else "waiting"
+                db.execute("""UPDATE sources SET title=?,mark=?,status=?,detail='',edit_profile=COALESCE(?,edit_profile),
+                              queued_at=CASE WHEN rel_file IS NOT NULL THEN ? ELSE NULL END WHERE id=?""",
+                           (title or existing["title"], mark, status, encoded_profile, entered, existing["id"]))
+                return existing["id"] if return_id else True
             if existing and (existing["status"] != "waiting" or not file or existing["lang"] != lang):
                 raise ValueError("Этот источник уже есть или указан другой язык.")
             if fingerprint and db.execute("SELECT 1 FROM sources WHERE fingerprint=?", (fingerprint,)).fetchone():
                 raise ValueError("Этот файл уже был добавлен.")
             try:
                 if existing:
-                    db.execute("""UPDATE sources SET rel_file=?, fingerprint=?, status=?, mark=?, title=?,queued_at=?
-                                  WHERE id=?""", (file, fingerprint, status, mark, title or Path(file).stem,
-                                                 entered, existing["id"]))
+                    db.execute("""UPDATE sources SET rel_file=?,fingerprint=?,status=?,mark=?,title=?,queued_at=?,
+                                  edit_profile=COALESCE(?,edit_profile) WHERE id=?""",
+                               (file, fingerprint, status, mark, title or Path(file).stem, entered, encoded_profile,
+                                existing["id"]))
+                    source_id = existing["id"]
                 else:
-                    db.execute("""INSERT INTO sources(lang,title,url,source_key,rel_file,fingerprint,mark,status,created,kind,queued_at,last_seen)
-                                  VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
-                               (lang, title or (Path(file).stem if file else urlsplit(url).netloc), url,
-                                key or None, file or None, fingerprint, mark, status, entered, kind, entered if file else None, discovered_at))
+                    row = db.execute("""INSERT INTO sources(lang,title,url,source_key,rel_file,fingerprint,mark,
+                        status,created,kind,queued_at,last_seen,edit_profile) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        (lang, title or (Path(file).stem if file else urlsplit(url).netloc or "Новый источник"),
+                         url, key or None, file or None, fingerprint, mark, status, entered, kind,
+                         entered if file else None, discovered_at, encoded_profile))
+                    source_id = row.lastrowid
             except sqlite3.IntegrityError:
                 raise ValueError("Этот файл или источник уже был добавлен.") from None
-        return True
+        return source_id if return_id else True
 
     def receive_video(self, stream, size, metadata):
         lang = language(metadata)
@@ -356,13 +392,14 @@ class Studio:
                     os.utime(temporary, None)
                     os.link(temporary, destination)
                     try:
-                        self.add_source({**metadata, "file": destination.name}, file_digest=digest.hexdigest())
+                        source_id = self.add_source({**metadata, "file": destination.name},
+                                                    file_digest=digest.hexdigest(), return_id=True)
                     except Exception:
                         destination.unlink()
                         raise
             finally:
                 temporary.unlink(missing_ok=True)
-        return {"name": destination.name}
+        return {"id": source_id, "name": destination.name}
 
     def add_account(self, data):
         lang = language(data)
@@ -595,6 +632,7 @@ class Studio:
 
     def edit_one(self):
         with self.db() as db:
+            db.execute("BEGIN IMMEDIATE")
             pending = db.execute("""
                 SELECT * FROM sources WHERE status IN ('queued','waiting_layout')
                 AND rel_file IS NOT NULL ORDER BY queued_at,id
@@ -605,6 +643,9 @@ class Studio:
                 return
             db.execute("UPDATE sources SET status='editing', detail='' WHERE id=?", (source["id"],))
         dest = self.output / f"source-{source['id']}"
+        if saved := source["edit_profile"]:
+            revision = hashlib.sha256(f"{source['mark']}\n{saved}".encode("utf-8")).hexdigest()[:16]
+            dest = dest.with_name(f"{dest.name}-{revision}")
         try:
             path = self.media_file(source["lang"], source["rel_file"])
             with path.open("rb") as stream:
@@ -612,17 +653,21 @@ class Studio:
                     raise ValueError("Файл изменился после добавления.")
             cmd = [sys.executable, str(HERE.parent / "clips.py"), str(path), "--output", str(dest),
                    "--topic", "GTA 6", "--count", "3", "--seconds", "35"]
-            cmd.extend(reaction.editor_arguments(
-                path, required=bool(source["url"]) or os.environ.get("STREAMCUT_REACTION_ONLY") == "1",
-                transcribe=os.environ.get("STREAMCUT_TRANSCRIBE") == "1",
-            ))
             if source["url"]:
                 cmd.extend(("--source-url", source["url"]))
-            if source["mark"] is not None:
-                cmd.extend(("--at", str(source["mark"])))
             manifest = dest / "manifest.json"
             if not manifest.exists():
-                run = subprocess.run(cmd, cwd=HERE.parent, capture_output=True, text=True, timeout=7200)
+                profile = json.loads(saved) if saved else None
+                moments = profile.get("moments") if profile else None
+                if profile and profile["mode"] == "model":
+                    moments = moment_model.select_moments(profile["transcript"], source["lang"])
+                if moments is None and source["mark"] is not None:
+                    cmd.extend(("--at", str(source["mark"])))
+                with reaction.editor_arguments(
+                    path, required=bool(source["url"]) or os.environ.get("STREAMCUT_REACTION_ONLY") == "1",
+                    transcribe=os.environ.get("STREAMCUT_TRANSCRIBE") == "1", profile=profile, moments=moments,
+                ) as args:
+                    run = subprocess.run(cmd + args, cwd=HERE.parent, capture_output=True, text=True, timeout=7200)
                 if run.returncode:
                     raise ValueError(run.stderr.strip()[-650:] or "Ошибка монтажа.")
             clips = json.loads(manifest.read_text())["clips"]
@@ -635,7 +680,7 @@ class Studio:
                     lang = source["lang"]
                     verified = (detected.get("code") == LANGS[lang] and
                                 detected.get("confidence", 0) >= 0.90)
-                    title = {"EN": f"GTA 6 • Stream Highlight #{index}",
+                    title = clip.get("headline") or {"EN": f"GTA 6 • Stream Highlight #{index}",
                              "ESP": f"GTA 6 • Momento del directo #{index}"}.get(lang, clip["title"])
                     db.execute("INSERT INTO clips(source_id,lang,title,relative_path,verified) VALUES (?,?,?,?,?)",
                                (source["id"], lang, title, str(filename.relative_to(self.output)), int(verified)))
@@ -921,6 +966,7 @@ class Studio:
 
 class Handler(SimpleHTTPRequestHandler):
     MAX_BODY = 16 * 1024
+    MAX_SOURCE_BODY = 4 * 1024 * 1024
 
     def log_message(self, *_):
         # OAuth callback query parameters contain authorization codes.
@@ -958,6 +1004,13 @@ class Handler(SimpleHTTPRequestHandler):
             return
         if url.path == "/api/state":
             self.send_json(self.server.studio.snapshot())
+            return
+        if url.path == "/api/source-edit":
+            try:
+                identifier = int(parse_qs(url.query, max_num_fields=1).get("id", ["0"])[0])
+                self.send_json(self.server.studio.source_edit(identifier))
+            except ValueError as error:
+                self.send_json({"error": str(error)}, 400)
             return
         if url.path == "/oauth/youtube":
             try:
@@ -1044,14 +1097,15 @@ class Handler(SimpleHTTPRequestHandler):
                 self.connection.settimeout(45)
                 self.send_json(studio.receive_video(self.rfile, size, fields), 201)
                 return
-            if not 0 < size <= self.MAX_BODY or self.headers.get_content_type() != "application/json":
+            limit = self.MAX_SOURCE_BODY if url.path == "/api/sources" else self.MAX_BODY
+            if not 0 < size <= limit or self.headers.get_content_type() != "application/json":
                 raise ValueError("Некорректное тело запроса.")
             payload = json.loads(self.rfile.read(size))
             if not isinstance(payload, dict):
                 raise ValueError("Некорректное тело запроса.")
             result = {}
             if self.path == "/api/sources":
-                studio.add_source(payload)
+                result = {"id": studio.add_source(payload, return_id=True)}
             elif self.path == "/api/sources/dismiss":
                 studio.dismiss_source(payload.get("id"))
             elif self.path == "/api/accounts":
