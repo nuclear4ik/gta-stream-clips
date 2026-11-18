@@ -72,6 +72,32 @@ class SourcePipelineTests(unittest.TestCase):
         self.assertEqual(service.get_source(42)["url"], URL)
         self.assertEqual(service.source_edit(42)["edit"]["facecam"], PROFILE["facecam"])
 
+    def test_claim_closes_cursor_before_import_with_two_pending_sources(self):
+        service = self.service()
+        identifiers = []
+        for language in ("RU", "EN"):
+            media = service.input / language / "sample.mp4"
+            media.write_bytes(language.encode())
+            identifiers.append(service.add_source({"lang": language, "file": media.name}, return_id=True))
+
+        def fake_editor(command, **_):
+            folder = Path(command[command.index("--output") + 1])
+            folder.mkdir()
+            (folder / "clip.mp4").write_bytes(b"fixture")
+            (folder / "manifest.json").write_text(json.dumps({
+                "clips": [{"video": "clip.mp4", "title": "Test clip"}],
+            }))
+            return subprocess.CompletedProcess(command, 0)
+
+        with patch("studio.subprocess.run", side_effect=fake_editor), patch.dict(os.environ, {
+            "STREAMCUT_REACTION_ONLY": "0",
+        }):
+            service.edit_one()
+            self.assertEqual([service.get_source(i)["status"] for i in identifiers], ["ready", "queued"])
+            service.edit_one()
+        self.assertEqual([service.get_source(i)["status"] for i in identifiers], ["ready", "ready"])
+        self.assertEqual({clip["source_id"] for clip in service.snapshot()["clips"]}, set(identifiers))
+
     @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "Requires FFmpeg and ffprobe")
     def test_discovered_source_with_local_recording_reaches_playable_mp4(self):
         service = self.service()
