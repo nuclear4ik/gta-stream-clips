@@ -1,5 +1,6 @@
 """Prepare reaction jobs from local recordings without per-recording input."""
 
+from concurrent.futures import ThreadPoolExecutor
 from fnmatch import fnmatchcase
 from functools import lru_cache
 import json
@@ -18,12 +19,13 @@ from editing import Rectangle, get_crops, parse_crop
 
 LANGUAGES = {"RU": "ru", "EN": "en", "ESP": "es"}
 WINDOW_SECONDS = 120
-WINDOW_COUNT = 4
+WINDOW_CONTEXT_SECONDS = 6
 MIN_CLIP_SECONDS = 25
 MAX_CLIP_SECONDS = 50
 MAX_SOURCE_SECONDS = 24 * 60 * 60
 CAMERA_SAMPLE_POSITIONS = (.08, .24, .45, .68, .88)
 MIN_CAMERA_HITS = 4
+MIN_INSET_FACE_HITS = 2
 
 
 def enabled():
@@ -31,13 +33,10 @@ def enabled():
 
 
 def analysis_windows(duration):
-    duration = min(duration, MAX_SOURCE_SECONDS)
-    if duration <= WINDOW_COUNT * WINDOW_SECONDS:
-        return [(start, min(WINDOW_SECONDS, duration - start))
-                for start in range(0, math.ceil(duration), WINDOW_SECONDS) if start < duration]
-    partition = duration / WINDOW_COUNT
-    return [((index + .5) * partition - WINDOW_SECONDS / 2, WINDOW_SECONDS)
-            for index in range(WINDOW_COUNT)]
+    if not math.isfinite(duration) or not 0 < duration <= MAX_SOURCE_SECONDS:
+        raise ValueError("Автомонтаж поддерживает исходные записи длительностью до 24 часов.")
+    return [(start, min(WINDOW_SECONDS, duration - start))
+            for start in range(0, math.ceil(duration), WINDOW_SECONDS) if start < duration]
 
 
 def configured_layout(video, title, recording):
@@ -114,17 +113,31 @@ def transcription(model, samples, lang, start, duration, *, vad):
 
 def transcribe_recording(video, recording, model, lang):
     captions = []
-    for start, duration in analysis_windows(recording.duration):
-        samples = audio_samples(video, recording, start, duration)
-        if samples.size < 8000:
-            continue
-        window = transcription(model, samples, lang, start, duration, vad=True)
-        if sum(cue.end - cue.start for cue in window) < 2:
-            # Quiet streamer microphones can be missed by the speech activity filter.
-            retry = transcription(model, samples, lang, start, duration, vad=False)
-            if sum(cue.end - cue.start for cue in retry) > sum(cue.end - cue.start for cue in window):
-                window = retry
-        captions.extend(window)
+    chunks = iter(analysis_windows(recording.duration))
+    with ThreadPoolExecutor(max_workers=1) as decoder:
+        def read_chunk(chunk):
+            begin, duration = chunk
+            start = max(0, begin - WINDOW_CONTEXT_SECONDS)
+            length = min(recording.duration, begin + duration + WINDOW_CONTEXT_SECONDS) - start
+            return begin, duration, start, length, decoder.submit(audio_samples, video, recording, start, length)
+
+        current = read_chunk(next(chunks))
+        while current is not None:
+            begin, duration, start, length, audio = current
+            samples = audio.result()
+            following = next(chunks, None)
+            current = read_chunk(following) if following is not None else None
+            if samples.size < 8000:
+                continue
+            window = transcription(model, samples, lang, start, length, vad=True)
+            spoken = sum(cue.end - cue.start for cue in window)
+            if spoken < 2:
+                # Quiet streamer microphones can be missed by the speech activity filter.
+                retry = transcription(model, samples, lang, start, length, vad=False)
+                if sum(cue.end - cue.start for cue in retry) > spoken:
+                    window = retry
+            # Context on both sides preserves utterances spanning a decode boundary.
+            captions.extend(cue for cue in window if begin <= (cue.start + cue.end) / 2 < begin + duration)
     if not captions:
         raise ValueError("Автомонтаж не нашёл речь с таймкодами в исходной дорожке.")
     return captions
@@ -158,14 +171,14 @@ def nearby(first, second):
     return abs(x - a) <= .07 and abs(y - b) <= .10 and .60 <= first[2] / second[2] <= 1.67
 
 
-def stable_face(frames):
+def stable_face(frames, *, minimum_hits=MIN_CAMERA_HITS):
     # Count independent sample frames rather than multiple detections in the same frame.
     groups = []
     for frame in frames:
         for seed in frame:
             neighboring = [next((box for box in boxes if nearby(seed, box)), None) for boxes in frames]
             candidates = [box for box in neighboring if box]
-            if len(candidates) >= MIN_CAMERA_HITS:
+            if len(candidates) >= minimum_hits:
                 representative = tuple(median(values) for values in zip(*candidates))
                 groups.append((representative, len(candidates)))
     if not groups:
@@ -176,12 +189,13 @@ def stable_face(frames):
     return best
 
 
-@lru_cache(maxsize=1)
-def face_detector():
+@lru_cache(maxsize=2)
+def face_detector(*, profile=False):
     try:
         import cv2
         classifier = cv2.CascadeClassifier
-        model_path = Path(cv2.data.haarcascades) / "haarcascade_frontalface_default.xml"
+        cascade = "profileface" if profile else "frontalface_default"
+        model_path = Path(cv2.data.haarcascades) / f"haarcascade_{cascade}.xml"
     except (ImportError, AttributeError) as error:
         raise reaction.MissingReactionProfile(
             "Установите opencv-python-headless>=4.8,<5 для определения камеры "
@@ -197,30 +211,113 @@ def crop_string(box):
     return ",".join(str(value) for value in (box.x, box.y, box.width, box.height))
 
 
+def corner_rectangle(frames):
+    """Find the two inner edges of an inset anchored to the upper-left corner."""
+    import numpy as np
+
+    _, height, width, _ = frames.shape
+    if min(width, height) < 120:
+        return None
+    corner = frames[:, :int(height * .67), :int(width * .57)]
+    vertical = np.abs(corner[:, :, 1:] - corner[:, :, :-1]).max(axis=-1)
+    horizontal = np.abs(corner[:, 1:] - corner[:, :-1]).max(axis=-1)
+    # Median RGB contrast suppresses brief gameplay edges and retains camera boundaries.
+    col = np.pad(np.clip(np.median(vertical, axis=0) / 32, 0, 1).cumsum(axis=0), ((1, 0), (0, 0)))
+    row = np.pad(np.clip(np.median(horizontal, axis=0) / 32, 0, 1).cumsum(axis=1), ((0, 0), (1, 0)))
+    xs = np.arange(int(width * .11), int(width * .42))
+    ys = np.arange(int(height * .13), int(height * .49))[:, None]
+    vertical_inside = col[ys - 3, xs - 1] / (ys - 3)
+    horizontal_inside = row[ys - 1, xs - 3] / (xs - 3)
+    outside_y = np.minimum(len(col) - 1, ys + np.maximum(18, ys // 3))
+    outside_x = np.minimum(row.shape[1] - 1, xs + np.maximum(18, xs // 3))
+    vertical_outside = (col[outside_y, xs - 1] - col[ys + 4, xs - 1]) / (outside_y - ys - 4)
+    horizontal_outside = (row[ys - 1, outside_x] - row[ys - 1, xs + 4]) / (outside_x - xs - 4)
+    vertical_change = vertical_inside - vertical_outside
+    horizontal_change = horizontal_inside - horizontal_outside
+    ratio = xs / ys
+    viable = ((vertical_inside > .34) & (horizontal_inside > .34) & (vertical_change > .15)
+              & (horizontal_change > .15) & (ratio > .75) & (ratio < 2.9))
+    # Both strong edges should end near their intersection, not continue into gameplay.
+    scores = np.where(viable, .5 * (vertical_inside + horizontal_inside)
+                      + .3 * (vertical_change + horizontal_change), 0)
+    y, x = np.unravel_index(scores.argmax(), scores.shape)
+    if scores[y, x] > 0:
+        return Rectangle(0, 0, int(xs[x]), int(ys[y, 0]))
+    return None
+
+
+def inset_rectangles(frames):
+    import numpy as np
+
+    if len(frames) < MIN_CAMERA_HITS:
+        return []
+    pixels = np.stack(frames, dtype=np.int16)
+    _, height, width, _ = pixels.shape
+    candidates = []
+    for bottom in (False, True):
+        for right in (False, True):
+            oriented = pixels[:, ::-1 if bottom else 1, ::-1 if right else 1]
+            if box := corner_rectangle(oriented):
+                candidates.append(Rectangle(width - box.width if right else 0,
+                                            height - box.height if bottom else 0, box.width, box.height))
+    return candidates
+
+
+def inset_face(frames, camera, detector):
+    import cv2
+
+    profile = face_detector(profile=True)
+    contrast = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(6, 6))
+    options = {"scaleFactor": 1.08, "minNeighbors": 3, "minSize": (22, 22)}
+    faces_by_frame = []
+    for frame in frames:
+        region = frame[camera.y:camera.bottom, camera.x:camera.right]
+        enhanced = contrast.apply(region)
+        faces = detector.detectMultiScale(region, **options)
+        if not len(faces):
+            faces = detector.detectMultiScale(enhanced, **options)
+        if not len(faces):
+            faces = profile.detectMultiScale(enhanced, **options)
+        if not len(faces):
+            faces = [(camera.width - x - w, y, w, h)
+                     for x, y, w, h in profile.detectMultiScale(cv2.flip(enhanced, 1), **options)]
+        faces_by_frame.append(edge_faces(((x + camera.x, y + camera.y, w, h) for x, y, w, h in faces),
+                                         frame.shape[1], frame.shape[0]))
+    return stable_face(faces_by_frame, minimum_hits=MIN_INSET_FACE_HITS)
+
+
 def detected_layout(video, recording, interval):
+    import cv2
     import numpy as np
 
     detector = face_detector()
     width = max(2, min(960, recording.width) // 2 * 2)
     height = max(2, round(recording.height * width / recording.width / 2) * 2)
     start, end = interval["start_seconds"], interval["end_seconds"]
-    frames = []
+    images = []
     for fraction in CAMERA_SAMPLE_POSITIONS:
         raw = decode(video, start + (end - start) * fraction, recording.video_index, [
-            "-frames:v", "1", "-vf", f"scale={width}:{height},format=gray", "-pix_fmt", "gray",
+            "-frames:v", "1", "-vf", f"scale={width}:{height},format=rgb24", "-pix_fmt", "rgb24",
             "-c:v", "rawvideo", "-threads:v", "1", "-f", "rawvideo",
         ])
-        if len(raw) != width * height:
-            continue
-        frame = np.frombuffer(raw, dtype=np.uint8).reshape(height, width)
-        faces = detector.detectMultiScale(frame, scaleFactor=1.1, minNeighbors=6, minSize=(14, 14))
-        frames.append(edge_faces(faces, width, height))
-    box = stable_face(frames)
-    if box is None:
+        if len(raw) == width * height * 3:
+            images.append(np.frombuffer(raw, dtype=np.uint8).reshape(height, width, 3))
+    grays = [cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY) for frame in images]
+    insets = [(camera, box) for camera in inset_rectangles(images) if (box := inset_face(grays, camera, detector))]
+    if len(insets) > 1:
         return None
-    x, y, w, h = box
-    left, right = max(0, x - .88 * w), min(1, x + 1.88 * w)
-    top, bottom = max(0, y - .42 * h), min(1, y + 1.64 * h)
+    if insets:
+        camera, box = insets[0]
+        left, right = camera.x / width, camera.right / width
+        top, bottom = camera.y / height, camera.bottom / height
+    else:
+        box = stable_face([edge_faces(detector.detectMultiScale(
+            frame, scaleFactor=1.1, minNeighbors=6, minSize=(14, 14)), width, height) for frame in grays])
+        if box is None:
+            return None
+        x, y, w, h = box
+        left, right = max(0, x - .88 * w), min(1, x + 1.88 * w)
+        top, bottom = max(0, y - .42 * h), min(1, y + 1.64 * h)
     px0, px1 = round(left * recording.width), round(right * recording.width)
     py0, py1 = round(top * recording.height), round(bottom * recording.height)
     facecam = crop_string(Rectangle(px0, py0, px1 - px0, py1 - py0))
@@ -252,25 +349,29 @@ def compatible(existing, candidate, recording):
     return overlap / (first.area + second.area - overlap) >= .60
 
 
-def speech_language(video, recording, model, intervals):
+def speech_languages(video, recording, model, intervals):
     evidence = []
     for interval in intervals:
         start, end = interval["start_seconds"], interval["end_seconds"]
         samples = audio_samples(video, recording, start, end - start)
         if samples.size < 8000:
-            return None
+            evidence.append(None)
+            continue
         code, confidence, _ = model.detect_language(audio=samples, language_detection_segments=2,
                                                     language_detection_threshold=.9)
-        if not isinstance(code, str) or not math.isfinite(confidence) or not 0 <= confidence <= 1:
-            return None
-        evidence.append((code, confidence))
-    if len({code for code, _ in evidence}) == 1:
-        return {"code": evidence[0][0], "confidence": min(score for _, score in evidence)}
+        valid = isinstance(code, str) and math.isfinite(confidence) and 0 <= confidence <= 1
+        evidence.append({"code": code, "confidence": confidence} if valid else None)
+    return evidence
+
+
+def agreed_language(evidence):
+    if all(evidence) and len({item["code"] for item in evidence}) == 1:
+        return {"code": evidence[0]["code"], "confidence": min(item["confidence"] for item in evidence)}
     return None
 
 
 def prepare(video: Path, lang: str, title: str, limit: int) -> dict:
-    if lang not in LANGUAGES or not 1 <= limit <= moment_model.MAX_MOMENTS:
+    if lang not in LANGUAGES or not 1 <= limit <= moment_model.MAX_ARCHIVE_MOMENTS:
         raise ValueError("Проверьте язык и количество мест для автомонтажа.")
     if not os.environ.get("STREAMCUT_OLLAMA_MODEL", "").strip():
         raise ValueError("Для автомонтажа укажите STREAMCUT_OLLAMA_MODEL и запустите Ollama.")
@@ -291,6 +392,7 @@ def prepare(video: Path, lang: str, title: str, limit: int) -> dict:
     srt = as_srt(captions)
     moments = moment_model.select_moments(
         srt, lang, minimum=MIN_CLIP_SECONDS, maximum=MAX_CLIP_SECONDS, complete=True,
+        limit=moment_model.MAX_ARCHIVE_MOMENTS, archive=True,
     )
     maximum = min(MAX_SOURCE_SECONDS, math.floor(recording.duration * 1000) / 1000)
     chosen, layout = [], configured
@@ -315,6 +417,8 @@ def prepare(video: Path, lang: str, title: str, limit: int) -> dict:
         )
     validated = reaction.normalize_profile({
         **layout, "headline": chosen[0]["headline"], "mode": "manual", "transcript": srt, "moments": chosen,
-    })
-    validated["speech_language"] = speech_language(video, recording, model, chosen)
+    }, automatic=True)
+    evidence = speech_languages(video, recording, model, chosen)
+    validated["speech_languages"] = evidence
+    validated["speech_language"] = agreed_language(evidence)
     return validated

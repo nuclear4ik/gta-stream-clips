@@ -135,6 +135,65 @@ class SourcePipelineTests(unittest.TestCase):
         with service.db() as db:
             self.assertEqual(db.execute("SELECT COUNT(*) FROM sources").fetchone()[0], 1)
 
+    def test_strict_discovery_does_not_save_sources_without_media_access(self):
+        service = self.service()
+        observed = studio.iso(studio.now())
+        candidate = dict(lang="RU", kind="vod", url="https://www.twitch.tv/videos/125", twitch_user="11",
+                         title="GTA VI", creator="Автор", author="11", directory_followup=True,
+                         key="twitch:stream:15", archive_id="125", observed=observed, popularity=8, provider="Twitch")
+        settings = {"STREAMCUT_TWITCH_STRICT_RU": "1", "STREAMCUT_YOUTUBE_AUTO_TWITCH_BROADCASTERS": "11",
+                    "TWITCH_CLIENT_ID": "id", "TWITCH_CLIENT_SECRET": "secret"}
+        with patch.dict(os.environ, settings, clear=True), patch("twitch_directory.search", return_value={
+            "RU": [candidate], "EN": [], "ESP": [],
+        }):
+            service.search(force=True)
+            with service.db() as db:
+                self.assertIsNone(db.execute("SELECT id FROM sources").fetchone())
+            local = service.input / "RU" / "twitch-vod-125.mp4"
+            local.write_bytes(b"approved fixture")
+            earlier = time.time() - 6
+            os.utime(local, times=(earlier, earlier))
+            service.search(force=True)
+            service.scan()
+            state = service.snapshot()
+            self.assertTrue(state["strict_ru_sources"])
+            self.assertEqual([row["url"] for row in state["sources"]], [candidate["url"]])
+
+    def test_directory_checks_every_30_minutes_and_registers_only_successful_downloads(self):
+        service = self.service()
+        instant = studio.now().replace(microsecond=0)
+        candidate = dict(lang="RU", kind="vod", url="https://www.twitch.tv/videos/125", twitch_user="11",
+                         title="GTA VI", creator="Автор", author="11", directory_followup=True,
+                         directory_priority=1, key="twitch:stream:15", archive_id="125",
+                         observed=studio.iso(instant), popularity=8, provider="Twitch")
+        settings = {"STREAMCUT_TWITCH_STRICT_RU": "1", "STREAMCUT_YOUTUBE_AUTO_TWITCH_BROADCASTERS": "11",
+                    "TWITCH_CLIENT_ID": "id", "TWITCH_CLIENT_SECRET": "secret"}
+        with patch.dict(os.environ, settings, clear=True), patch("twitch_directory.search", return_value={
+            "RU": [candidate], "EN": [], "ESP": [],
+        }) as directory:
+            for elapsed, expected in ((0, 1), (29, 1), (30, 2)):
+                with patch("studio.now", return_value=instant + studio.timedelta(minutes=elapsed)):
+                    service.search()
+                self.assertEqual(directory.call_count, expected)
+            with patch("studio.automatic_editing", return_value=True), patch(
+                    "twitch_media.configured", return_value=True), patch("twitch_media.fetch", return_value=None) as fetch:
+                service.fetch_twitch_media()
+                fetch.assert_called_once()
+                with service.db() as db:
+                    self.assertEqual(db.execute("SELECT count(*) FROM sources").fetchone()[0], 0)
+                service.media_checks.clear()
+
+                def download(_candidate, destination, *, current):
+                    destination.write_bytes(b"official file")
+                    earlier = time.time() - 6
+                    os.utime(destination, times=(earlier, earlier))
+                    return destination
+
+                fetch.side_effect = download
+                service.fetch_twitch_media()
+                service.scan()
+            self.assertEqual([row["status"] for row in service.snapshot()["sources"]], ["queued"])
+
     def test_old_database_can_store_profile_without_discarding_sources(self):
         with sqlite3.connect(self.root / "studio.db") as db:
             db.executescript(studio.SCHEMA.replace(", edit_profile TEXT", ""))
@@ -207,6 +266,58 @@ class SourcePipelineTests(unittest.TestCase):
         ready = next(row for row in result["clips"] if row["source_id"] == identifier)
         self.assertIn("#Shorts", ready["hashtags"])
         self.assertIn("Готовый клип", ready["description"])
+
+    def test_archive_batches_resume_after_inventory_space_and_keep_per_moment_language(self):
+        service = self.service()
+        service.add_account(dict(lang="RU", platform="YouTube", name="RU", route="server",
+                                 target="UC" + "r" * 22))
+        path = service.input / "RU" / "full.mp4"
+        path.write_bytes(b"long source")
+        source_id = service.add_source({"lang": "RU", "file": path.name}, return_id=True)
+        moments = [{"start_seconds": index * 30, "end_seconds": index * 30 + 25,
+                    "headline": "Спокойная поездка по городу"} for index in range(12)]
+        transcript = "\n\n".join(
+            f"{index + 1}\n00:{index // 2:02d}:{index % 2 * 30:02d},000 --> "
+            f"00:{index // 2:02d}:{index % 2 * 30 + 20:02d},000\nМомент начинается здесь."
+            for index in range(len(moments))
+        )
+        fixture = {"headline": "Спокойная поездка по городу", "facecam": "0%,0%,20%,20%",
+                   "transcript": transcript, "mode": "manual", "moments": moments,
+                   "speech_languages": [{"code": "en", "confidence": .99}] +
+                                       [{"code": "ru", "confidence": .99}] * 11}
+        ranges_used = []
+
+        def editor(command, **_):
+            target = Path(command[command.index("--output") + 1])
+            selected = json.loads(Path(command[command.index("--ranges") + 1]).read_text())["moments"]
+            ranges_used.append([item["start_seconds"] for item in selected])
+            clips = []
+            target.mkdir()
+            for index, item in enumerate(selected):
+                if item["start_seconds"] == 0:  # One input interval produced no clip.
+                    continue
+                relative = f"{index}.mp4"
+                (target / relative).write_bytes(b"rendered")
+                clips.append(item | {"video": relative, "title": item["headline"]})
+            (target / "manifest.json").write_text(json.dumps({"clips": clips}))
+            return subprocess.CompletedProcess(command, 0)
+
+        with patch("studio.automatic_editing", return_value=True), patch(
+                "studio.autocut.prepare", return_value=fixture) as model, patch(
+                "studio.subprocess.run", side_effect=editor):
+            service.edit_one()
+            self.assertEqual(service.get_source(source_id)["auto_offset"], 10)
+            service.edit_one()
+            service.edit_one()
+            self.assertEqual(len(ranges_used), 2)
+            with service.db() as db:
+                self.assertEqual(db.execute("SELECT COUNT(*) FROM clips WHERE verified=1").fetchone()[0], 10)
+                db.execute("UPDATE queue SET status='preloaded' WHERE id=(SELECT min(id) FROM queue)")
+            service.edit_one()
+            model.assert_called_once()
+        self.assertEqual(ranges_used, [list(range(0, 300, 30)), [300], [330]])
+        source = service.get_source(source_id)
+        self.assertEqual((source["status"], source["auto_offset"], source["auto_plan"]), ("ready", 12, None))
 
     @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "Requires FFmpeg and ffprobe")
     def test_discovered_source_with_local_recording_reaches_playable_mp4(self):

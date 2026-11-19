@@ -2,6 +2,7 @@
 
 from datetime import timedelta
 import os
+from urllib.parse import urlencode
 
 import discovery
 import regional
@@ -11,6 +12,9 @@ TOP_CHANNELS = 10
 ARCHIVES_PER_CHANNEL = 5
 CATEGORY = "Grand Theft Auto VI"
 FOLLOWUP_WINDOW = timedelta(hours=24)
+STRICT_RU = "STREAMCUT_TWITCH_STRICT_RU"
+RU_AUTHORS = "STREAMCUT_TWITCH_RU"
+MIN_RU_FOLLOWERS = 1_000_000
 
 
 def category_id(headers):
@@ -22,15 +26,24 @@ def category_id(headers):
     raise discovery.ConnectionProblem("Категория Grand Theft Auto VI не найдена в Twitch.")
 
 
-def market_streams(lang, code, game_id, headers, current):
-    rows = discovery.helix("streams", [("game_id", game_id), ("language", code),
-                                      ("first", TOP_CHANNELS * 2)], headers, "Топ каналов Twitch")
+def market_streams(lang, code, game_id, headers, current, *, channels=None):
+    params = [("game_id", game_id), ("language", code), ("first", TOP_CHANNELS * 2)]
+    if channels is not None:
+        params.extend(("user_id", user) for user in channels)
+    rows = discovery.helix("streams", params, headers, "Топ каналов Twitch")
     candidates = []
     users = set()
-    for row in sorted(rows, key=lambda item: regional.count(item.get("viewer_count")), reverse=True):
+    if channels is None:
+        rows = sorted(rows, key=lambda row: regional.count(row.get("viewer_count")), reverse=True)
+    else:
+        priority = {user: index for index, user in enumerate(channels)}
+        rows = sorted(rows, key=lambda row: priority.get(row.get("user_id"), len(priority)))
+    for row in rows:
         if row.get("language") != code or row.get("game_id") != game_id:
             continue
-        login = row.get("user_login", "").lower()
+        if channels is not None and row.get("user_id") not in channels:
+            continue
+        login = row.get("user_login", "").lower() if channels is None else channels[row["user_id"]]
         item = regional.twitch_item(row, lang, login, current, live=True, category=True)
         if not item or item["twitch_user"] in users:
             continue
@@ -78,19 +91,62 @@ def channel_archives(channel, rows, current, known_live, *, exact=False):
             yield item
 
 
-def configured_ru_archives(archives, headers, current, known_live, game_id):
-    if "STREAMCUT_TWITCH_RU" not in os.environ:
-        return
-    try:
-        channels = discovery.twitch_channels({"RU": "ru"}, {"RU": discovery.twitch_authors("RU")}, headers)
-    except discovery.ConnectionProblem:
-        return
-    for user, (login, _) in channels.items():
+def explicit_ru_channels(headers):
+    if RU_AUTHORS not in os.environ:
+        return {}
+    terms = discovery.twitch_authors("RU")
+    channels = discovery.twitch_channels({"RU": "ru"}, {"RU": terms}, headers)
+    by_login = {login: user for user, (login, _) in channels.items()}
+    ordered = {}
+    for term in terms:
+        user = term if discovery.TWITCH_ID.fullmatch(term) else by_login.get(term)
+        if user in channels:
+            ordered[user] = channels[user][0]
+    return ordered
+
+
+def channel_followers(user, headers):
+    params = urlencode({"broadcaster_id": user, "first": 1})
+    status, _, body = discovery.request("server", "api.twitch.tv", "GET",
+                                        f"/helix/channels/followers?{params}", headers)
+    total = discovery.json_response(status, body, "Число подписчиков Twitch").get("total")
+    if type(total) is not int or total < 0:
+        raise discovery.ConnectionProblem("Twitch не подтвердил число подписчиков.")
+    return total
+
+
+def qualified_channels(headers):
+    channels = explicit_ru_channels(headers)
+    eligible = {}
+    failures = []
+    for user, login in channels.items():
+        try:
+            followers = channel_followers(user, headers)
+        except discovery.ConnectionProblem as error:
+            failures.append(error)
+            continue
+        if followers >= MIN_RU_FOLLOWERS:
+            eligible[user] = login
+    if failures and len(failures) == len(channels):
+        raise failures[0]
+    return eligible
+
+
+def archive_candidates(channels, archives, headers, current, known_live, game_id, *, active=()):
+    live_channels = {stream["twitch_user"]: stream for stream in active}
+    for user, login in channels.items():
         if user in archives:
             continue  # Current top channels are already covered.
-        channel = dict(twitch_user=user, twitch_login=login, lang="RU", game_id=game_id)
+        channel = live_channels.get(user) or dict(twitch_user=user, twitch_login=login, lang="RU", game_id=game_id)
         rows = optional_archive_rows(user, archives, headers)
         yield from channel_archives(channel, rows, current, known_live)
+
+
+def optional_ru_channels(headers):
+    try:
+        return explicit_ru_channels(headers)
+    except discovery.ConnectionProblem:
+        return {}
 
 
 def previous_selection(entries, lang, game_id, current):
@@ -132,21 +188,40 @@ def search(languages, current, *, known_live=(), previous=None):
     secret = os.environ.get("TWITCH_CLIENT_SECRET")
     if not client or not secret:
         return None
+    strict = os.environ.get(STRICT_RU) == "1"
+    results = {lang: [] for lang in languages}
+    if strict and (languages.get("RU") != "ru" or not os.environ.get(RU_AUTHORS, "").strip()):
+        return results
     headers = discovery.twitch_headers(client, secret)
+    channels = qualified_channels(headers) if strict else None
+    if strict and not channels:
+        return results
     game_id = category_id(headers)
     known_live = set(known_live)
-    results = {}
     previous = previous or {}
-    for lang, code in languages.items():
+    for lang, code in ({"RU": "ru"} if strict else languages).items():
         selected, archives = [], {}
-        for stream in market_streams(lang, code, game_id, headers, current):
-            selected.append(stream)
-            user = stream["twitch_user"]
-            archives[user] = archive_rows(user, headers)
-            selected.extend(channel_archives(stream, archives[user], current, known_live))
-        if lang == "RU":
-            selected.extend(configured_ru_archives(archives, headers, current, known_live, game_id))
+        active = market_streams(lang, code, game_id, headers, current, channels=channels)
+        if strict:
+            selected.extend(active)
+            selected.extend(archive_candidates(channels, archives, headers, current, known_live, game_id, active=active))
+        else:
+            for stream in active:
+                selected.append(stream)
+                user = stream["twitch_user"]
+                archives[user] = archive_rows(user, headers)
+                selected.extend(channel_archives(stream, archives[user], current, known_live))
+            if lang == "RU":
+                followed = optional_ru_channels(headers)
+                selected.extend(archive_candidates(followed, archives, headers, current, known_live, game_id))
         retained = list(previous_selection(previous.get(lang, ()), lang, game_id, current))
+        if strict:
+            retained = [item for item in retained if item["twitch_user"] in channels]
         follow_archives(selected, retained, archives, headers, current)
+        if strict:
+            priority = {user: index for index, user in enumerate(channels, start=1)}
+            for item in selected:
+                item["directory_priority"] = priority[item["twitch_user"]]
+            selected.sort(key=lambda item: item["directory_priority"])
         results[lang] = selected
     return results

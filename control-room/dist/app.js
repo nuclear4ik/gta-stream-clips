@@ -16,6 +16,7 @@
   const defaults = {RU: 'After the Chase | GTA 6', EN: 'One More Job | GTA 6', ESP: 'Una más | GTA 6'};
   const editModes = {auto: 'Автоматически по видео', model: 'Нейросеть по SRT', manual: 'Точные интервалы'};
   const configurableSources = new Set(['waiting', 'waiting_layout', 'failed', 'empty']);
+  const unavailableTwitchSources = new Set(['twitch_wait_archive', 'twitch_wait_access', 'twitch_wait_check']);
   const maxTranscriptBytes = 512 * 1024;
   const labels = {
     waiting: 'Нужен исходный файл', waiting_layout: 'Нужны границы камеры', queued: 'В работе', editing: 'Монтируется', ready: 'Готово',
@@ -252,23 +253,28 @@
 
   function sourcesPage() {
     const roster = data.roster?.[sourcesLanguage] || [];
-    const sources = data.sources.filter(source => source.lang === sourcesLanguage);
     const ranked = data.ranking_updated?.[sourcesLanguage];
+    const checkedAt = ranked ? new Date(ranked) : null;
+    const lastCheck = checkedAt && !Number.isNaN(checkedAt.getTime())
+      ? ' · ' + checkFormatter.format(checkedAt) : '';
     const clipsBySource = new Map();
     for (const clip of data.clips || []) {
       if (clip.lang !== sourcesLanguage) continue;
       if (!clipsBySource.has(clip.source_id)) clipsBySource.set(clip.source_id, []);
       clipsBySource.get(clip.source_id).push(clip);
     }
+    const sources = data.sources.filter(source => source.lang === sourcesLanguage &&
+      (!data.strict_ru_sources || source.manual || source.rel_file || source.status === 'ready' ||
+        clipsBySource.has(source.id) || !unavailableTwitchSources.has(source.media_state)));
     return `<div class="heading"><div><h1>Источники</h1><p>Twitch · Grand Theft Auto VI</p></div>${mainButton('+ Источник', 'source')}</div>
       <section class="surface">
         <div class="bar"><div><strong>Автопоиск</strong>
           <small>${escape(data.search_status || (!data.live || data.search_configured
-            ? 'До 10 русскоязычных каналов · по числу зрителей'
+            ? 'Twitch · проверка каждые 30 минут'
             : 'Для поиска по категории нужны параметры API Twitch.'))}</small></div>
           ${data.live ? '<button class="quiet" data-do="scan" aria-pressed="' + data.settings.scan + '">' + (data.settings.scan ? 'Включён' : 'Выключен') + '</button>' : '<span class="status scheduled">Включён по умолчанию</span>'}</div>
         <div class="source-roster"><strong>${badge(sourcesLanguage)} ${countries[markets[sourcesLanguage].country]}</strong>
-          <small>${ranked ? 'Активные каналы · по зрителям' : 'Ожидает проверки категории'}</small>
+          <small>${escape((ranked ? 'Последняя проверка Twitch' : 'Ожидает проверки категории') + lastCheck)}</small>
           ${ranked && roster.length ? '<ol>' + roster.map(name => '<li>' + escape(name) + '</li>').join('') + '</ol>' : ''}</div>
         ${sources.length ? '<div class="job-list">' + sources.map(source =>
           sourceCard(source, clipsBySource.get(source.id) || [])).join('') + '</div>' :

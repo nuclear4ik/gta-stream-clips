@@ -42,6 +42,7 @@ MEDIA = {".mp4", ".mkv", ".mov", ".webm", ".ts"}
 CHANNEL_RE = re.compile(r"UC[A-Za-z0-9_-]{22}")
 INVENTORY_LIMIT = 10
 PUBLISH_LEAD = timedelta(minutes=15)
+TWITCH_DISCOVERY_INTERVAL = timedelta(minutes=30)
 TWITCH_FILE_PENDING = "Автоматическое получение пока не вернуло файл. Сервис проверит запись снова."
 TWITCH_FILE_ERROR = "Проверьте доступ к записи и соединение. Сервис повторит попытку."
 
@@ -148,7 +149,7 @@ CREATE TABLE IF NOT EXISTS sources (
     source_key TEXT UNIQUE, rel_file TEXT, fingerprint TEXT UNIQUE, mark INTEGER,
     status TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '', created TEXT NOT NULL, kind TEXT, queued_at TEXT,
     last_seen TEXT, edit_profile TEXT, auto_attempt INTEGER NOT NULL DEFAULT 0, speech_language TEXT,
-    twitch_broadcaster TEXT
+    twitch_broadcaster TEXT, auto_plan TEXT, auto_offset INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS discovery_feeds (
     lang TEXT NOT NULL, provider TEXT NOT NULL, checked_at TEXT NOT NULL, payload TEXT NOT NULL,
@@ -217,7 +218,8 @@ class Studio:
                 db.execute("UPDATE sources SET queued_at=created WHERE rel_file IS NOT NULL")
             for table, columns in (
                 ("sources", {"auto_attempt": "INTEGER NOT NULL DEFAULT 0", "speech_language": "TEXT",
-                             "twitch_broadcaster": "TEXT"}),
+                             "twitch_broadcaster": "TEXT", "auto_plan": "TEXT",
+                             "auto_offset": "INTEGER NOT NULL DEFAULT 0"}),
                 ("clips", {"verified": "INTEGER NOT NULL DEFAULT 0", "description": "TEXT NOT NULL DEFAULT ''",
                            "hashtags": "TEXT NOT NULL DEFAULT '[]'"}),
                 ("queue", {"retry_at": "TEXT", "auto_scheduled": "INTEGER"}),
@@ -285,6 +287,8 @@ class Studio:
     def snapshot(self):
         with self.db() as db:
             settings = {r["name"]: bool(r["value"]) for r in db.execute("SELECT * FROM settings")}
+            strict_sources = directory_mode() and os.environ.get(twitch_directory.STRICT_RU) == "1"
+            approved_authors = youtube_auto_broadcasters() if strict_sources else None
             sources = [dict(row) for row in db.execute("""SELECT id, lang, title, url, rel_file, mark,
                         status, detail, kind, last_seen, twitch_broadcaster FROM sources
                         WHERE status NOT IN ('dismissed','expired') ORDER BY id DESC LIMIT 300""")]
@@ -292,14 +296,23 @@ class Studio:
             queue_counts = self.ready_counts(db)
             recordings = {(lang, item["url"]): item for lang, (_, entries) in ranked.items()
                           for item in entries if item["provider"] == "Twitch" and item["kind"] == "vod"}
+            visible_sources = []
             for source in sources:
                 seen = source.pop("last_seen")
                 broadcaster = source.pop("twitch_broadcaster")
                 discovered = seen is not None or broadcaster is not None
+                source["manual"] = seen is None
+                is_twitch = source["url"].startswith(("https://www.twitch.tv/", "https://clips.twitch.tv/"))
+                if strict_sources and (source["lang"] != "RU" or is_twitch and approved_authors is not None
+                                       and broadcaster not in approved_authors):
+                    continue
+                if strict_sources and is_twitch and discovered and source["status"] == "waiting" and not source["rel_file"]:
+                    continue
                 if discovered and source["status"] == "waiting" and source["url"].startswith("https://www.twitch.tv/"):
                     candidate = recordings.get((source["lang"], source["url"]))
                     source["media_state"], source["detail"] = self.twitch_source_status(
                         source, candidate, settings["scan"], queue_counts[source["lang"]])
+                visible_sources.append(source)
             accounts = []
             for row in db.execute("""SELECT a.id, a.lang, a.platform, a.name, a.target,
                           a.route, a.auto, a.refresh_token IS NOT NULL AS connected, m.payload
@@ -319,7 +332,7 @@ class Studio:
                        q.external_id, q.account_id, c.title, c.lang, a.name AS account, a.platform
                        FROM queue q JOIN clips c ON c.id=q.clip_id JOIN accounts a ON a.id=q.account_id
                        ORDER BY CASE WHEN q.status IN ('uploaded','cancelled') THEN 1 ELSE 0 END, q.at LIMIT 500""")]
-        return {"live": True, "settings": settings, "sources": sources, "accounts": accounts,
+        return {"live": True, "settings": settings, "sources": visible_sources, "accounts": accounts,
                 "connections": self.connection_snapshot(checks), "queue_counts": queue_counts,
                 "inventory_limit": INVENTORY_LIMIT,
                 "roster": roster, "ranking_updated": ranking_updated,
@@ -327,6 +340,7 @@ class Studio:
                 "routes": {r: transport.route_available(r) for r in transport.REGIONS},
                 "oauth": transport.youtube_configured(), "uploads": self.uploads_enabled(),
                 "youtube_gateway_required": transport.youtube_gateway_required(),
+                "strict_ru_sources": strict_sources,
                 "search_configured": search_configured(), "search_status": self.search_status}
 
     @staticmethod
@@ -647,6 +661,8 @@ class Studio:
     def fetch_twitch_media(self):
         if not twitch_media.configured():
             return
+        strict = directory_mode() and os.environ.get(twitch_directory.STRICT_RU) == "1"
+        approved = youtube_auto_broadcasters() if strict else None
         instant = now()
         self.media_checks = {url: retry for url, retry in self.media_checks.items() if retry > instant}
         with self.db() as db:
@@ -656,16 +672,23 @@ class Studio:
             _, _, ranked = self.current_discovery(db, instant)
             waiting = {(row["lang"], row["url"]): row["id"] for row in db.execute(
                 "SELECT id,lang,url FROM sources WHERE status='waiting' AND rel_file IS NULL AND kind='vod'")}
+            handled = {(row["lang"], row["url"]) for row in db.execute(
+                """SELECT lang,url FROM sources
+                   WHERE kind='vod' AND (rel_file IS NOT NULL OR status NOT IN ('waiting','expired'))""")} if strict else set()
             pending_langs = {row["lang"] for row in db.execute("""SELECT DISTINCT lang FROM sources
                 WHERE rel_file IS NOT NULL AND status IN ('queued','editing')""")}
         for lang, (_, rows) in ranked.items():
             if not automatic_editing(lang) or counts[lang] >= INVENTORY_LIMIT or lang in pending_langs:
                 continue
-            candidates = sorted(rows, key=lambda item: (item.get("directory_rank", 100), -item["popularity"]))
+            candidates = sorted(rows, key=lambda item: (
+                item.get("directory_priority", item.get("directory_rank", 100)), -item["popularity"]))
             for item in candidates:
                 url = item["url"]
+                registered = (lang, url) in waiting
                 if (item["provider"] != "Twitch" or item["kind"] != "vod" or url in self.media_checks
-                        or (lang, url) not in waiting or not twitch_media.configured(item)):
+                        or (strict and (lang != "RU" or approved is not None and item.get("twitch_user") not in approved))
+                        or (strict and (lang, url) in handled)
+                        or (not strict and not registered) or not twitch_media.configured(item)):
                     continue
                 archive = url.rsplit("/", 1)[-1]
                 if not re.fullmatch(r"[0-9]{1,30}", archive):
@@ -678,10 +701,16 @@ class Studio:
                     received = twitch_media.fetch(item, destination, current=instant)
                     detail = "" if received is not None else TWITCH_FILE_PENDING
                 except (transport.ConnectionProblem, OSError, ValueError):
+                    received = None
                     detail = TWITCH_FILE_ERROR
-                with self.db() as db:
-                    db.execute("UPDATE sources SET detail=? WHERE id=? AND status='waiting'",
-                               (detail, waiting[lang, url]))
+                if strict:
+                    if received is None:
+                        continue
+                    self.add_source(item, key_override=item["key"], discovered_at=item["observed"])
+                elif registered:
+                    with self.db() as db:
+                        db.execute("UPDATE sources SET detail=? WHERE id=? AND status='waiting'",
+                                   (detail, waiting[lang, url]))
                 break
 
     @staticmethod
@@ -689,6 +718,8 @@ class Studio:
         fallback = discovery.roster()
         roster, updated, candidates = {}, {}, {}
         directory = directory_mode()
+        strict = directory and os.environ.get(twitch_directory.STRICT_RU) == "1"
+        approved = youtube_auto_broadcasters() if strict else None
         rows = db.execute("SELECT lang,provider,checked_at,payload FROM discovery_feeds").fetchall()
         for lang in LANGS:
             feeds = [row for row in rows if row["lang"] == lang and
@@ -696,6 +727,9 @@ class Studio:
                      (not directory or row["provider"] == "Twitch")]
             entries = [item for row in feeds for item in json.loads(row["payload"])]
             if directory:
+                if strict:
+                    entries = [item for item in entries if lang == "RU" and
+                               (approved is None or item.get("twitch_user") in approved)]
                 data = regional.current_candidates((item for item in entries if "directory_rank" in item or
                     item.get("directory_followup") and item["kind"] == "vod"), instant)
                 board = []
@@ -739,7 +773,8 @@ class Studio:
             retry = directory and db.execute("SELECT started_at FROM discovery_runs WHERE name=?",
                                              (retry_name,)).fetchone()
             previous = retry or db.execute("SELECT started_at FROM discovery_runs WHERE name=?", (run_name,)).fetchone()
-            interval = timedelta(minutes=5) if retry else timedelta(seconds=regional.REGIONAL_INTERVAL)
+            interval = timedelta(minutes=5) if retry else (
+                TWITCH_DISCOVERY_INTERVAL if directory else timedelta(seconds=regional.REGIONAL_INTERVAL))
             if not force and previous and datetime.fromisoformat(previous[0]) + interval > instant:
                 return
             if not directory and not live_only:
@@ -801,11 +836,19 @@ class Studio:
                 """SELECT source_key FROM sources WHERE status!='dismissed' AND kind='live'
                    AND COALESCE(last_seen,created)>=?""", (iso(instant - discovery.WINDOW),))}
         saved = 0
+        strict = directory and os.environ.get(twitch_directory.STRICT_RU) == "1"
         for board, rows in candidates.values():
             eligible = {item["author"] for item in board}
             per_author = {}
             for row in sorted(rows, key=lambda item: (item["popularity"], item["observed"]), reverse=True):
                 author, key = row["author"], row["key"]
+                if strict:
+                    archive = row.get("archive_id")
+                    if row["kind"] != "vod" or not isinstance(archive, str) or not discovery.TWITCH_ID.fullmatch(archive):
+                        continue
+                    inbox = self.input / row["lang"] / f"twitch-vod-{archive}.mp4"
+                    if not inbox.is_file() or inbox.is_symlink():
+                        continue
                 if not directory and key not in known_keys and (
                         author not in eligible or per_author.get(author, 0) >= 2):
                     continue
@@ -830,7 +873,8 @@ class Studio:
                     db.execute("""UPDATE sources SET status='expired' WHERE id IN (
                         SELECT id FROM sources WHERE lang=? AND status='waiting' AND last_seen IS NOT NULL
                         ORDER BY last_seen DESC,id DESC LIMIT -1 OFFSET 30)""", (lang,))
-        self.search_status = " · ".join(errors) if errors else f"Новые источники: {saved} · проверка раз в 5 часов"
+        cadence = "проверка каждые 30 минут" if directory else "проверка раз в 5 часов"
+        self.search_status = " · ".join(errors) if errors else f"Новые источники: {saved} · {cadence}"
 
     def dismiss_source(self, identifier):
         with self.db() as db:
@@ -867,37 +911,51 @@ class Studio:
                 source = next((row for row in pending if self.can_edit(row, counts)), None)
             if source is None:
                 return
-            limit = min(3, INVENTORY_LIMIT - counts[source["lang"]])
+            capacity = INVENTORY_LIMIT - counts[source["lang"]]
             db.execute("UPDATE sources SET status='editing', detail='' WHERE id=?", (source["id"],))
-        dest = self.output / f"source-{source['id']}"
-        if saved := source["edit_profile"]:
-            revision = hashlib.sha256(f"{source['mark']}\n{saved}".encode("utf-8")).hexdigest()[:16]
-            dest = dest.with_name(f"{dest.name}-{revision}")
         try:
+            saved = source["edit_profile"]
+            plan = json.loads(source["auto_plan"]) if source["auto_plan"] and not saved else None
+            offset = source["auto_offset"] if plan else 0
+            dest = self.output / f"source-{source['id']}"
+            if saved:
+                revision = hashlib.sha256(f"{source['mark']}\n{saved}".encode("utf-8")).hexdigest()[:16]
+                dest = dest.with_name(f"{dest.name}-{revision}")
+            elif offset:
+                dest = dest.with_name(f"{dest.name}-part-{offset + 1}")
             path = self.media_file(source["lang"], source["rel_file"])
             with path.open("rb") as stream:
                 if hashlib.file_digest(stream, "sha256").hexdigest() != source["fingerprint"]:
                     raise ValueError("Файл изменился после добавления.")
             cmd = [sys.executable, str(HERE.parent / "clips.py"), str(path), "--output", str(dest),
-                   "--topic", "GTA 6", "--count", str(limit), "--seconds", "35"]
+                   "--topic", "GTA 6", "--count", str(min(3, capacity)), "--seconds", "35"]
             if source["url"]:
                 cmd.extend(("--source-url", source["url"]))
             manifest = dest / "manifest.json"
             speech = json.loads(source["speech_language"]) if source["speech_language"] and not saved else {}
             if not manifest.exists():
                 profile = json.loads(saved) if saved else None
-                if profile is None and automatic_editing(source["lang"]) and not reaction.has_profile(path):
+                if (profile is None and plan is None and automatic_editing(source["lang"])
+                        and not reaction.has_profile(path)):
                     with self.db() as db:
                         db.execute("UPDATE sources SET auto_attempt=1 WHERE id=?", (source["id"],))
-                    raw = autocut.prepare(path, source["lang"], source["title"], limit)
+                    raw = autocut.prepare(path, source["lang"], source["title"], reaction.MAX_AUTOMATIC_MOMENTS)
                     speech = raw.pop("speech_language", None) or {}
-                    profile = reaction.normalize_profile(raw)
-                    with self.db() as db:
-                        db.execute("UPDATE sources SET speech_language=? WHERE id=?",
-                                   (json.dumps(speech), source["id"]))
+                    speech_languages = raw.pop("speech_languages", None) or []
+                    profile = reaction.normalize_profile(raw, automatic=True)
+                    plan = {"profile": profile, "speech_language": speech, "speech_languages": speech_languages}
+                if plan:
+                    profile = plan["profile"]
                 moments = profile.get("moments") if profile else None
+                if plan and moments:
+                    if "batch_end" not in plan:
+                        plan["batch_end"] = min(offset + capacity, len(moments))
+                        with self.db() as db:
+                            db.execute("UPDATE sources SET speech_language=?,auto_plan=? WHERE id=?",
+                                       (json.dumps(speech), json.dumps(plan, ensure_ascii=False), source["id"]))
+                    moments = moments[offset:plan["batch_end"]]
                 if profile and profile["mode"] == "model":
-                    moments = moment_model.select_moments(profile["transcript"], source["lang"])[:limit]
+                    moments = moment_model.select_moments(profile["transcript"], source["lang"])[:min(3, capacity)]
                 if moments is None and source["mark"] is not None:
                     cmd.extend(("--at", str(source["mark"])))
                 with reaction.editor_arguments(
@@ -908,6 +966,11 @@ class Studio:
                 if run.returncode:
                     raise ValueError(run.stderr.strip()[-650:] or "Ошибка монтажа.")
             clips = json.loads(manifest.read_text())["clips"]
+            speech_by_range = {}
+            if plan:
+                for moment, evidence in zip(plan["profile"]["moments"], plan["speech_languages"]):
+                    key = (round(moment["start_seconds"], 3), round(moment["end_seconds"], 3))
+                    speech_by_range[key] = evidence
             with self.db() as db:
                 db.execute("BEGIN IMMEDIATE")
                 if len(clips) > INVENTORY_LIMIT - self.ready_counts(db)[source["lang"]]:
@@ -918,7 +981,9 @@ class Studio:
                     filename = (dest / clip["video"]).resolve()
                     if not filename.is_relative_to(dest) or not filename.is_file():
                         raise ValueError("В экспорте отсутствует файл клипа.")
-                    detected = clip.get("speech_language") or speech
+                    key = (clip.get("start_seconds"), clip.get("end_seconds"))
+                    source_speech = speech_by_range.get(key, speech)
+                    detected = clip.get("speech_language") or source_speech or {}
                     lang = source["lang"]
                     verified = (detected.get("code") == LANGS[lang] and
                                 detected.get("confidence", 0) >= 0.90)
@@ -929,9 +994,19 @@ class Studio:
                                   VALUES (?,?,?,?,?,?,?)""", (source["id"], lang, title,
                                str(filename.relative_to(self.output)), int(verified), description,
                                json.dumps(tags, ensure_ascii=False)))
-                db.execute("UPDATE sources SET status=?, detail=? WHERE id=?",
-                           ("ready" if clips else "empty", "" if clips else "Добавьте источник с таймкодом.",
-                            source["id"]))
+                next_offset = plan.pop("batch_end") if plan else 0
+                remaining = len(plan["profile"]["moments"]) - next_offset if plan else 0
+                if remaining > 0:
+                    db.execute("""UPDATE sources SET status='queued',detail=?,auto_offset=?,auto_plan=?,
+                                  queued_at=? WHERE id=?""",
+                               (f"Осталось смонтировать моментов: {remaining}.", next_offset,
+                                json.dumps(plan, ensure_ascii=False),
+                                now().isoformat(timespec="microseconds"), source["id"]))
+                else:
+                    rendered = db.execute("SELECT 1 FROM clips WHERE source_id=? LIMIT 1", (source["id"],)).fetchone()
+                    db.execute("UPDATE sources SET status=?, detail=?,auto_offset=?,auto_plan=NULL WHERE id=?",
+                               ("ready" if rendered else "empty", "" if rendered else "Добавьте источник с таймкодом.",
+                                next_offset, source["id"]))
                 self.populate(db)
         except reaction.MissingReactionProfile as error:
             with self.db() as db:
@@ -1136,13 +1211,16 @@ class Studio:
         earliest = instant + PUBLISH_LEAD
         requested = datetime.fromisoformat(job["at"])
         reserved = [datetime.fromisoformat(date) for date in remote_dates]
-        day_start, day_end = schedule.civil_day(requested, job["lang"])
-        automatic = job["auto_scheduled"] == 1
+        lang = job["lang"]
+        day_start, day_end = schedule.civil_day(requested, lang)
+        outside_automatic_window = job["auto_scheduled"] == 1 and not schedule.in_release_window(requested, lang)
+        spacing = schedule.slot_spacing(lang)
         if (requested >= earliest and sum(day_start <= stamp < day_end for stamp in reserved) < schedule.DAY_LIMIT
-                and (not automatic or schedule.in_release_window(requested, job["lang"]))
-                and all(abs(stamp - requested) >= timedelta(hours=1) for stamp in reserved)):
+                and not outside_automatic_window
+                and all(abs(stamp - requested) >= spacing for stamp in reserved)):
             return requested
-        return schedule.available_slot(max(earliest, requested), job["lang"], reserved)
+        after = earliest if outside_automatic_window else max(earliest, requested)
+        return schedule.available_slot(after, lang, reserved)
 
     @staticmethod
     def schedule_limit():

@@ -14,6 +14,8 @@ from captions import headline_words, parse_srt, plain_text
 from editing import parse_crop, parse_focus
 
 MAX_TRANSCRIPT = 512 * 1024
+MAX_AUTOMATIC_TRANSCRIPT = 8 * 1024 * 1024
+MAX_AUTOMATIC_MOMENTS = 20
 CROP_FIELDS = {"facecam": parse_crop, "gameplay": parse_crop,
                "facecam_focus": parse_focus, "gameplay_focus": parse_focus}
 
@@ -40,7 +42,7 @@ def clean_headline(raw):
     return value
 
 
-def normalize_profile(data):
+def normalize_profile(data, *, automatic=False):
     if (not isinstance(data, dict) or not {"facecam", "headline"} <= data.keys() or
             not data.keys() <= CROP_FIELDS.keys() | {"headline", "transcript", "moments", "mode"}):
         raise ValueError("Укажите область веб-камеры и заголовок.")
@@ -63,8 +65,9 @@ def normalize_profile(data):
         raise ValueError("Выберите режим отбора моментов.")
     profile["mode"] = mode
     transcript = data.get("transcript", "")
-    if not isinstance(transcript, str) or len(transcript.encode("utf-8")) > MAX_TRANSCRIPT:
-        raise ValueError("Расшифровка SRT должна занимать до 512 КиБ.")
+    transcript_limit = MAX_AUTOMATIC_TRANSCRIPT if automatic else MAX_TRANSCRIPT
+    if not isinstance(transcript, str) or len(transcript.encode("utf-8")) > transcript_limit:
+        raise ValueError("Расшифровка SRT превышает допустимый размер.")
     if transcript.strip():
         cues = parse_srt(transcript)
         if not cues:
@@ -74,8 +77,9 @@ def normalize_profile(data):
         raise ValueError("Для точных моментов нужна расшифровка SRT.")
     if mode == "manual":
         moments = data.get("moments")
-        if not isinstance(moments, list) or not 1 <= len(moments) <= 6:
-            raise ValueError("Укажите от одного до шести интервалов.")
+        moment_limit = MAX_AUTOMATIC_MOMENTS if automatic else 6
+        if not isinstance(moments, list) or not 1 <= len(moments) <= moment_limit:
+            raise ValueError(f"Укажите от одного до {moment_limit} интервалов.")
         profile["moments"] = []
         for moment in moments:
             if (not isinstance(moment, dict) or not {"start_seconds", "end_seconds"} <= moment.keys() or

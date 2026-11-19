@@ -219,13 +219,19 @@ class PublishingTests(unittest.TestCase):
         self.assertEqual((queue[first]["external_id"], queue[second]["external_id"]), (FIRST_VIDEO, SECOND_VIDEO))
         self.assertIsNone(queue[third]["external_id"])
 
-    def test_ru_automatic_release_uses_local_weekday_and_weekend_windows(self):
+    def test_ru_automatic_release_uses_same_half_hour_window_on_any_day(self):
         monday = datetime(2026, 11, 23, 6, tzinfo=timezone.utc)
         saturday = datetime(2026, 11, 21, 6, tzinfo=timezone.utc)
-        for now, expected in ((monday, 13), (saturday, 8)):
-            requested = now + timedelta(hours=1)
+        for now in (monday, saturday):
+            requested = now.replace(hour=18, minute=15)
+            first_slot = now.replace(hour=12)
+            next_slot = first_slot + timedelta(minutes=30)
             job = {"at": studio.iso(requested), "lang": "RU", "auto_scheduled": 1}
-            self.assertEqual(self.s.planned_time(job, [], now), now.replace(hour=expected))
+            self.assertEqual(self.s.planned_time(job, [], now), first_slot)
+            self.assertEqual(self.s.planned_time(job, [studio.iso(first_slot)], now), next_slot)
+            job["at"] = studio.iso(next_slot)
+            self.assertEqual(self.s.planned_time(job, [studio.iso(first_slot)], now), next_slot)
+            job["at"] = studio.iso(requested)
             self.assertEqual(self.s.planned_time(job | {"auto_scheduled": 0}, [], now), requested)
 
     def test_platform_limit_then_retry_preserves_queue(self):
@@ -385,6 +391,24 @@ class SourceTests(unittest.TestCase):
 
 
 class ScheduleTests(unittest.TestCase):
+    def test_ru_slots_cover_five_moscow_hours_then_roll_to_tomorrow(self):
+        start = datetime(2026, 11, 21, 12, tzinfo=timezone.utc)
+        slots = [start + timedelta(minutes=30 * i) for i in range(10)]
+        before = start - timedelta(minutes=1)
+        for index, slot in enumerate(slots):
+            self.assertTrue(schedule.in_release_window(slot, "RU"))
+            self.assertEqual(schedule.available_slot(before, "RU", slots[:index]), slot)
+        self.assertFalse(schedule.in_release_window(start + timedelta(hours=5), "RU"))
+        self.assertFalse(schedule.in_release_window(start + timedelta(minutes=15), "RU"))
+        self.assertEqual(schedule.available_slot(before, "RU", slots), start + timedelta(days=1))
+
+    def test_en_and_esp_keep_hourly_local_slots(self):
+        for lang in ("EN", "ESP"):
+            start = schedule.local_time("2026-11-21T09:00", lang)
+            half_hour = start + timedelta(minutes=30)
+            self.assertFalse(schedule.in_release_window(half_hour, lang))
+            self.assertEqual(schedule.available_slot(start, lang, [start]), start + timedelta(hours=1))
+
     def test_same_local_time_maps_to_different_cities_and_seasons(self):
         expected = {"RU": 6, "EN": 14, "ESP": 8}
         for lang, hour in expected.items():

@@ -1,11 +1,13 @@
 """Test discovery against the visible language-filtered Twitch directory."""
 
 from datetime import datetime, timedelta, timezone
+import json
 import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
+from urllib.parse import parse_qs, urlsplit
 
 import discovery
 import regional
@@ -132,6 +134,67 @@ class TwitchDirectoryTests(unittest.TestCase):
         self.assertTrue(all(row["directory_followup"] for row in found["RU"] if row["twitch_user"] == "2"))
         self.assertEqual(found["EN"], [])
         self.assertEqual(found["ESP"], [])
+
+    def test_strict_ru_prioritizes_scoped_current_and_offline_authors_with_a_million_followers(self):
+        current = datetime(2026, 11, 19, 9, tzinfo=timezone.utc)
+        app_headers = {"Authorization": "Bearer app-fixture"}
+        totals_requested, videos_requested = [], []
+
+        def follower_response(route, host, method, path, headers):
+            self.assertEqual((route, host, method, headers), ("server", "api.twitch.tv", "GET", app_headers))
+            url = urlsplit(path)
+            self.assertEqual(url.path, "/helix/channels/followers")
+            query = parse_qs(url.query)
+            user = query["broadcaster_id"][0]
+            self.assertEqual(query, {"broadcaster_id": [user], "first": ["1"]})
+            totals_requested.append(user)
+            counts = {"1": 1_000_000, "2": 999_999, "4": 1_500_000, "6": 1_400_000}
+            return 200, {}, json.dumps({"total": counts.get(user), "data": []}).encode()
+
+        def feed(endpoint, params, _headers, _action):
+            options = dict(params)
+            if endpoint == "users":
+                self.assertEqual(params, [("login", f"creator_{user}") for user in (6, 4, 1, 2, 3)])
+                return [{"id": str(user), "login": f"creator_{user}"} for user in range(1, 7)]
+            if endpoint == "games":
+                return [{"id": GAME, "name": "Grand Theft Auto VI"}]
+            if endpoint == "streams":
+                self.assertEqual(options["language"], "ru")
+                self.assertEqual(options["game_id"], GAME)
+                self.assertEqual([value for key, value in params if key == "user_id"], ["6", "4", "1"])
+                return [live(5, "ru", 500), live(2, "ru", 499), live(1, "ru", 400),
+                        live(4, "en", 350), live(4, "ru", 300) | {"game_id": "501"}, live(4, "ru", 25)]
+            user = options["user_id"]
+            videos_requested.append(user)
+            return {"1": [archive(1, "ru", current)],
+                    "4": [archive(4, "ru", current),
+                          archive(4, "ru", current, id="802", stream_id="1802", title="Контент без темы"),
+                          archive(4, "ru", current, id="803", title="GTA VI", viewable="private")],
+                    "6": [archive(6, "ru", current)]}.get(user, [])
+
+        recent = current - timedelta(hours=1)
+        old = regional.twitch_item(live(5, "ru", 500), "RU", "player_5", recent, live=True, category=True)
+        previous = {"RU": [dict(old, stream_id="1005", directory_rank=1, viewer_count=500, game_id=GAME)]}
+        env = SECRETS | {twitch_directory.STRICT_RU: "1",
+                         "STREAMCUT_TWITCH_RU": "creator_6|creator_4|creator_1|creator_2|creator_3"}
+        with patch.dict(os.environ, env, clear=True), patch("discovery.twitch_headers", return_value=app_headers), patch(
+                "discovery.helix", side_effect=feed), patch("discovery.request", side_effect=follower_response):
+            found = twitch_directory.search(LANGUAGES, current, previous=previous, known_live={("RU", "1006")})
+        self.assertEqual(totals_requested, ["6", "4", "1", "2", "3"])
+        self.assertEqual(videos_requested, ["6", "4", "1"])
+        self.assertEqual([(row["twitch_user"], row["directory_rank"]) for row in found["RU"] if row["kind"] == "live"],
+                         [("4", 1), ("1", 2)])
+        self.assertEqual([(row["archive_id"], row["directory_priority"]) for row in found["RU"] if row["kind"] == "vod"],
+                         [("3006", 1), ("3004", 2), ("3001", 3)])
+        self.assertEqual((found["EN"], found["ESP"]), ([], []))
+
+    def test_strict_ru_without_an_explicit_list_does_not_fall_back_to_other_creators(self):
+        current = datetime(2026, 11, 19, 9, tzinfo=timezone.utc)
+        env = SECRETS | {twitch_directory.STRICT_RU: "1"}
+        with patch.dict(os.environ, env, clear=True), patch("discovery.twitch_headers") as headers:
+            found = twitch_directory.search(LANGUAGES, current)
+        headers.assert_not_called()
+        self.assertEqual(found, {lang: [] for lang in LANGUAGES})
 
     def test_missing_key_and_missing_exact_category(self):
         current = datetime(2026, 11, 19, tzinfo=timezone.utc)

@@ -155,6 +155,35 @@ test('discovered Twitch sources show their acquisition stage', async () => {
   assert.doesNotMatch(app.innerHTML, /Нужен исходный файл/);
 });
 
+test('strict RU Sources hides inaccessible discoveries and keeps manual and ready items', async () => {
+  const fixtures = [
+    ['Скрытый эфир', 'twitch_wait_archive'],
+    ['Скрытая запись без доступа', 'twitch_wait_access'],
+    ['Скрытая запись без проверки', 'twitch_wait_check'],
+    ['Ссылка добавлена вручную', 'twitch_wait_archive', {manual: true}],
+    ['Исходник на диске', 'twitch_wait_access', {rel_file: 'fixture.mp4'}],
+    ['Готовый источник', 'twitch_wait_check', {status: 'ready'}],
+    ['Источник с экспортом', 'twitch_wait_check'],
+    ['Доступная запись Twitch', 'twitch_wait_media'],
+  ];
+  const {app, navigate} = await panel(() => assert.fail('source filtering is display only'), {
+    strict_ru_sources: true,
+    roster: {RU: ['Проверенный канал'], EN: ['Foreign channel']},
+    ranking_updated: {RU: '2026-11-19T08:00:00+00:00'},
+    sources: fixtures.map(([title, media_state, extra], index) =>
+      ({id: index + 1, lang: 'RU', title, media_state, status: 'waiting', ...extra})),
+    clips: [{id: 2, source_id: 7, lang: 'RU', title: 'Готовый клип'}],
+    queue: [{id: 3, clip_id: 2, status: 'preloaded', lang: 'RU', platform: 'YouTube',
+      title: 'Клип в расписании', at: '2026-11-19T12:00:00+00:00'}],
+  });
+  assert.doesNotMatch(app.innerHTML, /Скрытый эфир|Скрытая запись|Foreign channel/);
+  for (const [title] of fixtures.slice(3)) assert.match(app.innerHTML, new RegExp(title));
+  assert.match(app.innerHTML, /Проверенный канал/);
+  assert.match(app.innerHTML, /Готовый клип/);
+  navigate('queue');
+  assert.match(app.innerHTML, /Клип в расписании/);
+});
+
 test('Sources shows only Russian media and rankings while Queue keeps other languages', async () => {
   const languages = [
     ['RU', 'Городской эфир', 'Первый русский клип', 'Быстрый стример'],
