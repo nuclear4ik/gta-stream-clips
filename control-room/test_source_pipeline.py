@@ -159,6 +159,41 @@ class SourcePipelineTests(unittest.TestCase):
             self.assertTrue(state["strict_ru_sources"])
             self.assertEqual([row["url"] for row in state["sources"]], [candidate["url"]])
 
+    def test_full_inventory_does_not_stop_discovery_or_a_late_authorized_drop(self):
+        service = self.service()
+        instant = studio.now().replace(microsecond=0)
+        candidate = dict(lang="RU", kind="vod", url="https://www.twitch.tv/videos/125", twitch_user="12",
+                         title="GTA VI", creator="Автор", author="12", directory_followup=True,
+                         key="twitch:stream:15", archive_id="125", observed=studio.iso(instant),
+                         popularity=8, provider="Twitch")
+        settings = {"STREAMCUT_TWITCH_STRICT_RU": "1", "STREAMCUT_YOUTUBE_AUTO_TWITCH_BROADCASTERS": "11",
+                    "TWITCH_CLIENT_ID": "id", "TWITCH_CLIENT_SECRET": "secret"}
+        with service.db() as db:
+            db.executemany("""INSERT INTO clips(lang,title,relative_path,verified) VALUES
+                           ('RU','Готовый',?,1)""", [(f"{index}.mp4",) for index in range(30)])
+        with patch.dict(os.environ, settings, clear=True), patch("twitch_directory.search", return_value={
+            "RU": [candidate], "EN": [], "ESP": [],
+        }) as directory:
+            for clock in (instant, instant + studio.timedelta(minutes=30)):
+                with patch("studio.now", return_value=clock):
+                    service.search()
+            self.assertEqual(directory.call_count, 2)
+            state = service.snapshot()
+            self.assertEqual(state["source_health"], {"archives": 1, "accessible": 0, "active": 0})
+            self.assertEqual(state["inventory_limit"], 30)
+            self.assertEqual(state["queue_counts"]["RU"], 30)
+            media = service.input / "RU" / "twitch-vod-125.mp4"
+            media.write_bytes(b"owner-provided fixture")
+            earlier = time.time() - 6
+            os.utime(media, times=(earlier, earlier))
+            service.scan()
+            with patch("autocut.prepare") as cutter:
+                service.edit_one()
+            cutter.assert_not_called()
+            state = service.snapshot()
+            self.assertEqual(state["source_health"], {"archives": 0, "accessible": 0, "active": 1})
+            self.assertEqual([item["status"] for item in state["sources"]], ["queued"])
+
     def test_directory_checks_every_30_minutes_and_registers_only_successful_downloads(self):
         service = self.service()
         instant = studio.now().replace(microsecond=0)
@@ -266,6 +301,81 @@ class SourcePipelineTests(unittest.TestCase):
         ready = next(row for row in result["clips"] if row["source_id"] == identifier)
         self.assertIn("#Shorts", ready["hashtags"])
         self.assertIn("Готовый клип", ready["description"])
+
+    def test_strict_ru_counts_thirty_verified_clips_and_reopens_after_preload(self):
+        with patch.dict(os.environ, {"STREAMCUT_DISCOVERY_MODE": "twitch", "STREAMCUT_TWITCH_STRICT_RU": "1"}):
+            service = self.service()
+            service.add_account(dict(lang="RU", platform="YouTube", name="RU", route="server",
+                                     target="UC" + "r" * 22))
+            with service.db() as db:
+                db.executemany("INSERT INTO clips(lang,title,relative_path,verified) VALUES (?,?,?,?)", [
+                    ("RU", str(i), f"clip-{i}.mp4", 1) for i in range(30)
+                ] + [("RU", "Unverified", "unverified.mp4", 0), ("EN", "Historical", "historical.mp4", 1)])
+                service.populate(db)
+            path = service.input / "RU" / "next.mp4"
+            path.write_bytes(b"fixture")
+            identifier = service.add_source({"lang": "RU", "file": path.name}, return_id=True)
+            with patch("studio.subprocess.run") as editor:
+                service.edit_one()
+                editor.assert_not_called()
+            self.assertEqual(service.get_source(identifier)["status"], "queued")
+            self.assertEqual(service.snapshot()["queue_counts"], {"RU": 30, "EN": 0, "ESP": 0})
+            with service.db() as db:
+                db.execute("UPDATE queue SET status='preloaded' WHERE clip_id=1")
+                self.assertEqual(service.inventory_capacity(service.ready_counts(db), "RU"), 1)
+
+    @patch.dict(os.environ, {"STREAMCUT_DISCOVERY_MODE": "twitch", "STREAMCUT_TWITCH_STRICT_RU": "1"})
+    def test_strict_automatic_sources_discard_missing_camera_and_wrong_language(self):
+        service = self.service()
+        ids = []
+        for archive in ("100", "101"):
+            path = service.input / "RU" / f"twitch-vod-{archive}.mp4"
+            path.write_bytes(archive.encode())
+            ids.append(service.add_source({
+                "lang": "RU", "url": f"https://www.twitch.tv/videos/{archive}", "provider": "Twitch",
+                "kind": "vod", "twitch_user": "300", "file": path.name,
+            }, discovered_at=studio.iso(studio.now()), return_id=True))
+        profile = {
+            **PROFILE, "mode": "manual", "moments": [{"start_seconds": 0, "end_seconds": 30}],
+            "speech_languages": [{"code": "en", "confidence": .99}],
+        }
+        with patch("studio.automatic_editing", return_value=True), patch("studio.autocut.prepare", side_effect=[
+            studio.reaction.MissingReactionProfile("Камера неоднозначна."), profile,
+        ]), patch("studio.subprocess.run") as editor:
+            service.edit_one()
+            service.edit_one()
+            editor.assert_not_called()
+        self.assertEqual([service.get_source(i)["status"] for i in ids], ["dismissed", "dismissed"])
+        self.assertFalse(service.snapshot()["clips"])
+
+    @patch.dict(os.environ, {"STREAMCUT_DISCOVERY_MODE": "twitch", "STREAMCUT_TWITCH_STRICT_RU": "1"})
+    def test_interrupted_automatic_export_reuses_plan_and_retries_timeout_once(self):
+        service = self.service()
+        path = service.input / "RU" / "vod-valid.mp4"
+        path.write_bytes(b"long source")
+        identifier = service.add_source({
+            "lang": "RU", "url": "https://www.twitch.tv/videos/100", "provider": "Twitch",
+            "kind": "vod", "twitch_user": "300", "file": path.name,
+        }, discovered_at=studio.iso(studio.now()), return_id=True)
+        profile = {
+            **PROFILE, "mode": "manual", "moments": [{"start_seconds": 0, "end_seconds": 30}],
+            "speech_languages": [{"code": "ru", "confidence": .99}],
+        }
+        with patch("studio.automatic_editing", return_value=True), \
+             patch("studio.autocut.prepare", return_value=profile) as prepare, \
+             patch("studio.subprocess.run", side_effect=subprocess.TimeoutExpired(["editor"], 1)) as editor:
+            service.edit_one()
+            pending = service.get_source(identifier)
+            self.assertEqual(pending["status"], "queued")
+            self.assertEqual(json.loads(pending["auto_plan"])["batch_end"], 1)
+            with service.db() as db:
+                db.execute("UPDATE sources SET status='editing' WHERE id=?", (identifier,))
+            service.close()
+            service = self.service()
+            service.edit_one()
+            prepare.assert_called_once()
+            self.assertEqual(editor.call_count, 2)
+        self.assertEqual(service.get_source(identifier)["status"], "failed")
 
     def test_archive_batches_resume_after_inventory_space_and_keep_per_moment_language(self):
         service = self.service()

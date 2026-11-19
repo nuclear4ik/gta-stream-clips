@@ -27,8 +27,8 @@ MIN_CAMERA_HITS = 4
 MIN_INSET_FACE_HITS = 2
 
 
-def enabled():
-    return os.environ.get("STREAMCUT_AUTOCUT") == "1"
+def enabled(*, default=False):
+    return os.environ.get("STREAMCUT_AUTOCUT", "1" if default else "0") == "1"
 
 
 def analysis_windows(duration):
@@ -349,7 +349,7 @@ def speech_languages(video, recording, model, intervals):
         code, confidence, _ = model.detect_language(audio=samples, language_detection_segments=2,
                                                     language_detection_threshold=.9)
         valid = isinstance(code, str) and math.isfinite(confidence) and 0 <= confidence <= 1
-        evidence.append({"code": code, "confidence": confidence} if valid else None)
+        evidence.append({"code": code, "confidence": float(confidence)} if valid else None)
     return evidence
 
 
@@ -362,8 +362,6 @@ def agreed_language(evidence):
 def prepare(video: Path, lang: str, title: str, limit: int) -> dict:
     if lang not in LANGUAGES or not 1 <= limit <= moment_model.MAX_ARCHIVE_MOMENTS:
         raise ValueError("Проверьте язык и количество мест для автомонтажа.")
-    if not os.environ.get("STREAMCUT_OLLAMA_MODEL", "").strip():
-        raise ValueError("Для автомонтажа укажите STREAMCUT_OLLAMA_MODEL и запустите Ollama.")
     try:
         recording = probe(video)
     except RuntimeError as error:
@@ -379,10 +377,18 @@ def prepare(video: Path, lang: str, title: str, limit: int) -> dict:
     model = whisper_model(name)
     captions = transcribe_recording(video, recording, model, LANGUAGES[lang])
     srt = as_srt(captions)
-    moments = moment_model.select_moments(
-        srt, lang, minimum=MIN_CLIP_SECONDS, maximum=MAX_CLIP_SECONDS, complete=True,
-        limit=moment_model.MAX_ARCHIVE_MOMENTS, archive=True,
-    )
+    try:
+        moments = moment_model.select_moments(
+            srt, lang, minimum=MIN_CLIP_SECONDS, maximum=MAX_CLIP_SECONDS, complete=True,
+            limit=moment_model.MAX_ARCHIVE_MOMENTS, archive=True,
+        )
+    except ValueError as model_error:
+        moments = moment_model.fallback_moments(
+            captions, lang, minimum=MIN_CLIP_SECONDS, maximum=MAX_CLIP_SECONDS,
+            limit=moment_model.MAX_ARCHIVE_MOMENTS,
+        )
+        if not moments:
+            raise ValueError("В записи нет завершённых фрагментов с речью длительностью 25–50 секунд.") from model_error
     maximum = min(MAX_SOURCE_SECONDS, math.floor(recording.duration * 1000) / 1000)
     chosen, layout = [], configured
     for interval in moments:

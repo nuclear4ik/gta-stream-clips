@@ -33,9 +33,12 @@ def clip_configured(broadcaster):
     if not os.environ.get("TWITCH_CLIENT_ID"):
         return False
     if broadcaster is None:
-        return any(name.startswith(TOKEN_KEY) and discovery.TWITCH_ID.fullmatch(name[len(TOKEN_KEY):])
-                   and value.strip() for name, value in os.environ.items())
-    return bool(os.environ.get(TOKEN_KEY + broadcaster, "").strip())
+        return any(clip_configured(name[len(prefix):])
+                   for name in os.environ for prefix in (TOKEN_KEY, EDITOR_KEY)
+                   if name.startswith(prefix) and discovery.TWITCH_ID.fullmatch(name[len(prefix):]))
+    token = os.environ.get(TOKEN_KEY + broadcaster, "").strip()
+    editor = os.environ.get(EDITOR_KEY + broadcaster, "").strip()
+    return bool(token or os.environ.get("TWITCH_CLIENT_SECRET") and discovery.TWITCH_ID.fullmatch(editor))
 
 
 def configured(candidate=None):
@@ -179,11 +182,14 @@ def fetch(candidate, destination, *, current=None):
         return download(url, destination, archive=True)
     if not clip_configured(broadcaster):
         return None
-    editor = os.environ.get(EDITOR_KEY + broadcaster, broadcaster)
+    editor = os.environ.get(EDITOR_KEY + broadcaster, "").strip() or broadcaster
     if not discovery.TWITCH_ID.fullmatch(editor):
         raise ValueError("Неверный ID редактора Twitch.")
-    headers = {"Client-Id": os.environ["TWITCH_CLIENT_ID"],
-               "Authorization": "Bearer " + os.environ[TOKEN_KEY + broadcaster].strip()}
+    client = os.environ["TWITCH_CLIENT_ID"]
+    if token := os.environ.get(TOKEN_KEY + broadcaster, "").strip():
+        headers = {"Client-Id": client, "Authorization": "Bearer " + token}
+    else:
+        headers = discovery.twitch_headers(client, os.environ["TWITCH_CLIENT_SECRET"])
     ids = clip_options(candidate, broadcaster, vod, current or datetime.now(timezone.utc), headers)
     if not ids:
         return None

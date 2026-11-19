@@ -1,10 +1,13 @@
 """Network checks and OAuth for the official platform APIs."""
 import base64
+from datetime import datetime, time, timedelta, timezone
+from email.utils import parsedate_to_datetime
 import http.client
 import ipaddress
 import json
 import os
 from urllib.parse import unquote, urlencode, urlsplit
+from zoneinfo import ZoneInfo
 
 API_HOSTS = {"YouTube": "www.googleapis.com", "TikTok": "open.tiktokapis.com",
              "Reels": "graph.instagram.com"}
@@ -20,6 +23,11 @@ YOUTUBE_SCOPES = " ".join((
     "https://www.googleapis.com/auth/youtube.force-ssl",
     "https://www.googleapis.com/auth/yt-analytics.readonly",
 ))
+YOUTUBE_PROJECT_QUOTA_REASONS = ("dailyLimitExceeded", "quotaExceeded")
+YOUTUBE_CAPACITY_REASONS = (
+    *YOUTUBE_PROJECT_QUOTA_REASONS, "uploadLimitExceeded",
+    "rateLimitExceeded", "userRateLimitExceeded", "tooManyRequests",
+)
 
 
 class ConnectionProblem(Exception):
@@ -32,6 +40,19 @@ class RouteProblem(ConnectionProblem):
 
 class NetworkProblem(ConnectionProblem):
     """No usable HTTP response was received."""
+
+
+class YouTubeCapacityProblem(ConnectionProblem):
+    """A definitive rejection due to rate, account or API capacity."""
+
+    def __init__(self, message, *, reason=None, retry_after_seconds=300):
+        super().__init__(message)
+        self.reason = reason
+        self.retry_after_seconds = retry_after_seconds
+
+    @property
+    def project_wide(self):
+        return self.reason in YOUTUBE_PROJECT_QUOTA_REASONS
 
 
 def proxy_setting(region):
@@ -133,7 +154,43 @@ def json_response(status, data, action):
     return result
 
 
-def youtube_auth_response(status, data, action):
+def youtube_retry_delay(reason, headers):
+    current = datetime.now(timezone.utc)
+    retry_after = next((value for key, value in headers.items() if key.lower() == "retry-after"), None)
+    if isinstance(retry_after, str) and retry_after:
+        try:
+            seconds = int(retry_after) if retry_after.isdecimal() else (
+                parsedate_to_datetime(retry_after) - current).total_seconds()
+            return max(1, min(172800, round(seconds)))
+        except (TypeError, ValueError, OverflowError):
+            pass
+    if reason in YOUTUBE_PROJECT_QUOTA_REASONS:
+        pacific = ZoneInfo("America/Los_Angeles")
+        next_day = current.astimezone(pacific).date() + timedelta(days=1)
+        resets = datetime.combine(next_day, time.min, tzinfo=pacific)
+        return max(300, round((resets - current).total_seconds()) + 5)
+    return 3600 if reason == "uploadLimitExceeded" else 300
+
+
+def check_youtube_capacity(status, data, headers, *, retry_transient=False):
+    if status in (400, 403, 429):
+        try:
+            errors = json.loads(data)["error"]["errors"]
+            reasons = {entry["reason"] for entry in errors if isinstance(entry, dict)
+                       and isinstance(entry.get("reason"), str)}
+        except (ValueError, TypeError, KeyError):
+            reasons = set()
+        reason = next((item for item in YOUTUBE_CAPACITY_REASONS if item in reasons), None)
+        if reason:
+            raise YouTubeCapacityProblem(f"YouTube временно отклонил запрос ({reason}).", reason=reason,
+                                         retry_after_seconds=youtube_retry_delay(reason, headers))
+    if retry_transient and (status == 429 or 500 <= status < 600):
+        raise YouTubeCapacityProblem(f"YouTube временно недоступен (HTTP {status}).",
+                                     retry_after_seconds=youtube_retry_delay(None, headers))
+
+
+def youtube_auth_response(status, headers, data, action):
+    check_youtube_capacity(status, data, headers)
     if status == 429 or 500 <= status < 600:
         raise RouteProblem(f"{action}: сервис временно недоступен (HTTP {status}).")
     return json_response(status, data, action)
@@ -144,9 +201,9 @@ def token_request(region, **fields):
         raise ConnectionProblem("На сервере не настроен OAuth YouTube.")
     body = urlencode({**fields, "client_id": os.environ["STREAMCUT_GOOGLE_CLIENT_ID"],
                       "client_secret": os.environ["STREAMCUT_GOOGLE_CLIENT_SECRET"]}).encode()
-    status, _, data = request(region, OAUTH_HOST, "POST", "/token",
-                              {"Content-Type": "application/x-www-form-urlencoded"}, body)
-    token = youtube_auth_response(status, data, "Авторизация YouTube")
+    status, headers, data = request(region, OAUTH_HOST, "POST", "/token",
+                                    {"Content-Type": "application/x-www-form-urlencoded"}, body)
+    token = youtube_auth_response(status, headers, data, "Авторизация YouTube")
     if not isinstance(token.get("access_token"), str):
         raise ConnectionProblem("YouTube не выдал токен доступа.")
     return token
@@ -154,9 +211,9 @@ def token_request(region, **fields):
 
 def confirm_channel(region, token, expected):
     headers = {"Authorization": f"Bearer {token}"}
-    status, _, data = request(region, API_HOSTS["YouTube"], "GET",
-                              "/youtube/v3/channels?part=id&mine=true", headers)
-    channels = youtube_auth_response(status, data, "Проверка канала").get("items", [])
+    status, response_headers, data = request(region, API_HOSTS["YouTube"], "GET",
+                                             "/youtube/v3/channels?part=id&mine=true", headers)
+    channels = youtube_auth_response(status, response_headers, data, "Проверка канала").get("items", [])
     if not isinstance(channels, list) or not any(isinstance(item, dict) and item.get("id") == expected
                                                 for item in channels):
         raise ConnectionProblem("Подключён другой канал YouTube. Выберите нужный канал при входе.")

@@ -123,6 +123,26 @@ class AutoCutTests(unittest.TestCase):
         self.assertEqual(result["moments"], choices[:20])
         self.assertIn("00:20:00,000 --> 00:20:27,000", result["transcript"])
 
+    def test_archive_uses_complete_speech_when_ollama_cannot_supply_a_moment(self):
+        class WhisperTime(float):
+            pass
+
+        cues = [autocut.Caption(WhisperTime(0), 6, "Ничего себе, какая скорость!"),
+                autocut.Caption(8, 15, "Мы выезжаем с трассы на пустую дорогу."),
+                autocut.Caption(18, WhisperTime(32), "Всё, кажется, мы наконец-то смогли от погони оторваться."),
+                autocut.Caption(57, 88, "А вот здесь потом мы попробуем и только после этого получится…")]
+        with patch.object(autocut, "probe", return_value=self.recording), \
+             patch.object(autocut, "configured_layout", return_value={"facecam": "0%,0%,22%,26%"}), \
+             patch.object(autocut, "whisper_model"), \
+             patch.object(autocut, "transcribe_recording", return_value=cues), \
+             patch.object(autocut.moment_model, "select_moments", side_effect=ValueError("Model unavailable")), \
+             patch.object(autocut, "speech_languages", return_value=[{"code": "ru", "confidence": .98}]):
+            result = autocut.prepare(self.video, "RU", "GTA VI", 20)
+        self.assertEqual(result["moments"], [{"start_seconds": 0, "end_seconds": 32,
+                                             "headline": "Ничего себе, какая скорость"}])
+        self.assertIs(type(result["moments"][0]["start_seconds"]), float)
+        self.assertIs(type(result["moments"][0]["end_seconds"]), float)
+
     def test_prepare_handles_missing_or_moving_camera_without_guessing(self):
         cues = [autocut.Caption(7, 37, "Так, идём смотреть карту.")]
         choices = [{"start_seconds": 7, "end_seconds": 37, "headline": "Идём смотреть карту"}]

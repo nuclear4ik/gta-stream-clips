@@ -205,7 +205,8 @@
       .sort((a, b) => Date.parse(jobTime(a)) - Date.parse(jobTime(b)));
     const history = jobs.filter(job => ['uploaded', 'cancelled'].includes(job.status) && current(job));
     const waiting = queueRows(backlog.filter(current), unassigned.filter(current));
-    const shownLimit = Number.isInteger(data.inventory_limit) && data.inventory_limit > 0 ? data.inventory_limit : null;
+    const localLimit = lang => (!data.strict_ru_sources || lang === 'RU') &&
+      Number.isInteger(data.inventory_limit) && data.inventory_limit > 0 ? data.inventory_limit : null;
     const counts = Object.fromEntries(Object.keys(markets).map(lang => [
       lang, data.queue_counts?.[lang] ?? new Set([
         ...backlog.filter(job => job.lang === lang).map(job => job.clip_id || job.id),
@@ -215,10 +216,13 @@
     return `<div class="heading"><div><h1>Очередь</h1><p>${data.live ? 'Готовые Shorts и расписание YouTube' : 'Пример очереди'}</p></div>
       ${mainButton('+ Источник', 'source')}</div>
       <div class="market-grid" role="group" aria-label="Видео к загрузке по аудиториям">
-        ${Object.entries(markets).map(([lang, market]) => `<button class="market surface" data-do="filter"
+        ${Object.entries(markets).map(([lang, market]) => {
+          const shownLimit = localLimit(lang);
+          return `<button class="market surface" data-do="filter"
           data-id="${lang}" aria-pressed="${filter === lang}"><span class="market-label">${badge(lang)}
           <span>${countries[market.country]}<small>${market.city}</small></span></span>
-          <strong aria-label="Локальный запас: ${metric(counts[lang])}${shownLimit ? ' из ' + metric(shownLimit) : ''}">${metric(counts[lang])}${shownLimit ? '<span> / ' + metric(shownLimit) + '</span>' : ''}</strong></button>`).join('')}
+          <strong aria-label="Локальный запас: ${metric(counts[lang])}${shownLimit ? ' из ' + metric(shownLimit) : ''}">${metric(counts[lang])}${shownLimit ? '<span> / ' + metric(shownLimit) + '</span>' : ''}</strong></button>`;
+        }).join('')}
       </div>
       <section class="surface">
         <div class="bar">
@@ -257,6 +261,10 @@
     const checkedAt = ranked ? new Date(ranked) : null;
     const lastCheck = checkedAt && !Number.isNaN(checkedAt.getTime())
       ? ' · ' + checkFormatter.format(checkedAt) : '';
+    const health = sourcesLanguage === 'RU' && data.source_health;
+    const sourceSummary = health && ranked
+      ? `Новых записей: ${metric(health.archives)} · настроено получение: ${metric(health.accessible)} · в обработке: ${metric(health.active)}`
+      : '';
     const clipsBySource = new Map();
     for (const clip of data.clips || []) {
       if (clip.lang !== sourcesLanguage) continue;
@@ -275,10 +283,13 @@
           ${data.live ? '<button class="quiet" data-do="scan" aria-pressed="' + data.settings.scan + '">' + (data.settings.scan ? 'Включён' : 'Выключен') + '</button>' : '<span class="status scheduled">Включён по умолчанию</span>'}</div>
         <div class="source-roster"><strong>${badge(sourcesLanguage)} ${countries[markets[sourcesLanguage].country]}</strong>
           <small>${escape((ranked ? 'Последняя проверка Twitch' : 'Ожидает проверки категории') + lastCheck)}</small>
+          ${sourceSummary ? '<small>' + escape(sourceSummary) + '</small>' : ''}
           ${ranked && roster.length ? '<ol>' + roster.map(name => '<li>' + escape(name) + '</li>').join('') + '</ol>' : ''}</div>
         ${sources.length ? '<div class="job-list">' + sources.map(source =>
           sourceCard(source, clipsBySource.get(source.id) || [])).join('') + '</div>' :
-            '<div class="blank"><strong>Нет источников</strong><p>Добавьте ссылку или положите разрешённый файл в папку RU.</p></div>'}
+            '<div class="blank"><strong>Нет источников для монтажа</strong><p>' + (health && ranked && health.archives && !health.accessible
+              ? 'Twitch вернул записи для просмотра. Для монтажа нужен доступ к файлу.'
+              : 'Панель продолжит искать записи автоматически.') + '</p></div>'}
       </section>`;
   }
 

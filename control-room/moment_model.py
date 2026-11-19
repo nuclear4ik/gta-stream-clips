@@ -21,10 +21,20 @@ MAX_RESPONSE_BYTES = 64 * 1024
 TOTAL_TIMEOUT_SECONDS = 360
 LANGUAGES = {"RU": "Russian", "EN": "English", "ESP": "Spanish"}
 RUSSIAN_PROFANITY = re.compile(
-    r"(?:[а-яё]*п[ие]зд|бля(?:д|т|$)|(?:ни|по|за|на|о|от|вы|про|у|при|до|пере|с|под|раз)?ху[йеяиюё]|"
+    r"(?!себ[ея]$)(?:[а-яё]*п[ие]зд|бля(?:д|т|$)|(?:ни|по|за|на|о|от|вы|про|у|при|до|пере|с|под|раз)?ху[йеяиюё]|"
     r"(?:за|на|о|от|вы|про|у|при|до|пере|с|под|раз|въ)?(?:[её]б|[её]пт)|[а-яё]*муд(?:ак|ил))",
     re.IGNORECASE,
 )
+REACTION_WORDS = {
+    "RU": r"погон\w*|неожидан\w*|впервые|смотри\w*|ничего себе|вот это|пряч\w*|сбеж\w*",
+    "EN": r"chase|escaped?|unexpected|surpris\w*|look at|no way|what happened|oh my",
+    "ESP": r"persecuci\w*|escap\w*|sorpres\w*|increíble|mira\w*|no puede ser|qué pasó",
+}
+FALLBACK_HEADLINES = {
+    "RU": "Реакция в прямом эфире",
+    "EN": "A live stream reaction",
+    "ESP": "Una reacción en directo",
+}
 
 
 def cue_id(number):
@@ -213,6 +223,59 @@ def resolve_moment(raw, captions, *, minimum=1, maximum=MAX_DURATION, complete=F
     return score, start, end, headline
 
 
+def nonoverlapping_moments(candidates, limit):
+    selected = []
+    for _, start, end, headline in sorted(candidates, key=lambda item: (-item[0], item[1], item[2])):
+        if any(start < item["end_seconds"] and end > item["start_seconds"] for item in selected):
+            continue
+        selected.append({"start_seconds": start, "end_seconds": end, "headline": headline})
+        if len(selected) == limit:
+            break
+    return selected
+
+
+def fallback_moments(captions, language, *, minimum, maximum, limit):
+    """Find full speech spans when the optional local dialogue model cannot help."""
+    reactions = re.compile(REACTION_WORDS[language], re.IGNORECASE)
+    word_counts = [len(headline_words(cue.text)) for cue in captions]
+    signals = [len(reactions.findall(cue.text)) + cue.text.count("!") + cue.text.count("?") for cue in captions]
+    candidates = []
+    for first, cue in enumerate(captions):
+        if not starts_sentence(captions, first):
+            continue
+        best = None
+        words, energy = 0, 0
+        for last in range(first, len(captions)):
+            ending = captions[last]
+            duration = ending.end - cue.start
+            if duration > maximum or (last > first and ending.start - captions[last - 1].end > MAX_DIALOGUE_GAP):
+                break
+            words += word_counts[last]
+            energy += signals[last]
+            if (duration < minimum or words < 12 or not closes_sentence(ending)
+                    or (last + 1 < len(captions) and captions[last + 1].start < ending.end - .04)):
+                continue
+            score = 2 * energy + min(words / duration, 3) - abs(duration - 34) / 20
+            if best is None or score > best[0]:
+                best = (score, last)
+        if best is not None:
+            score, last = best
+            candidates.append((score, round(float(cue.start), 3), round(float(captions[last].end), 3),
+                               fallback_headline(captions[first:last + 1], language, reactions)))
+    return nonoverlapping_moments(candidates, limit)
+
+
+def fallback_headline(captions, language, reactions):
+    for cue in sorted(captions, key=lambda cue: not bool(reactions.search(cue.text))):
+        text = cue.text.strip(' "«»“”').rstrip(".!?…")
+        words = headline_words(text)
+        if (closes_sentence(cue) and 3 <= len(words) <= 5 and len(text) <= 50
+                and not any(RUSSIAN_PROFANITY.match(word) for word in words)
+                and re.fullmatch(r"[\w .,!?:…«»\"“”'’–—-]+", text) and "_" not in text):
+            return text
+    return FALLBACK_HEADLINES[language]
+
+
 def select_moments(transcript, language, *, minimum=1, maximum=MAX_DURATION, complete=False,
                    limit=MAX_MOMENTS, archive=False):
     """Rank ranges from all cue batches and keep the strongest nonoverlapping moments."""
@@ -251,13 +314,7 @@ def select_moments(transcript, language, *, minimum=1, maximum=MAX_DURATION, com
             if moment and (not archive or moment[0] >= 3):
                 candidates.append(moment)
 
-    selected = []
-    for _, start, end, headline in sorted(candidates, key=lambda item: (-item[0], item[1], item[2])):
-        if any(start < item["end_seconds"] and end > item["start_seconds"] for item in selected):
-            continue
-        selected.append({"start_seconds": start, "end_seconds": end, "headline": headline})
-        if len(selected) == limit:
-            break
+    selected = nonoverlapping_moments(candidates, limit)
     if not selected:
         if complete:
             raise ValueError(f"Нейросеть не нашла завершённого фрагмента длительностью {minimum}–{maximum} секунд.")

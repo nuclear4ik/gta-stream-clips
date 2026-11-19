@@ -93,12 +93,33 @@ class YouTubeReleaseTests(unittest.TestCase):
             with self.assertRaises(youtube.SlotUnavailable) as raised:
                 self.upload()
             self.assertEqual(raised.exception.retry_after_seconds, 90)
+            self.assertFalse(raised.exception.project_wide)
         with patch("transport.request", side_effect=[
             (200, SESSION, b""), transport.ConnectionProblem("Connection timed out"), (308, {}, b""),
         ]) as request:
             with self.assertRaises(youtube.PublishUncertain):
                 self.upload()
             self.assertEqual(request.call_count, 3)
+
+    def test_project_quota_propagates_without_starting_or_retrying_an_upload(self):
+        quota = response(403, {"error": {"errors": [
+            {"reason": "userRateLimitExceeded"}, {"reason": "quotaExceeded"},
+        ]}}, {"Retry-After": "90"})
+        with patch("transport.request", return_value=quota) as request:
+            with self.assertRaises(youtube.SlotUnavailable) as raised:
+                transport.confirm_channel("server", "token", CHANNEL)
+            self.assertTrue(raised.exception.project_wide)
+            self.assertEqual((raised.exception.reason, raised.exception.retry_after_seconds), ("quotaExceeded", 90))
+            request.assert_called_once()
+
+        os.environ["STREAMCUT_YOUTUBE_REQUIRE_GATEWAY"] = "1"
+        os.environ["STREAMCUT_UPLOAD_GATEWAY"] = "http://trusted.example"
+        matched = response(200, {"items": [{"id": CHANNEL}]})
+        with patch("transport.request", side_effect=[matched, (200, SESSION, b""), quota]) as request:
+            with self.assertRaises(youtube.SlotUnavailable) as raised:
+                self.upload("gateway", expected_channel=CHANNEL)
+            self.assertTrue(raised.exception.project_wide)
+            self.assertEqual([call.args[2] for call in request.call_args_list], ["GET", "POST", "GET"])
 
     def test_direct_metadata_connection_failure_and_server_error_are_retryable(self):
         with patch("transport.request", side_effect=transport.NetworkProblem("timeout")) as request:

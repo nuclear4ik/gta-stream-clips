@@ -1,11 +1,9 @@
 """YouTube publication and schedule queries over the authenticated route."""
 
-from datetime import datetime, time, timedelta, timezone
-from email.utils import parsedate_to_datetime
+from datetime import datetime, timezone
 import json
 import re
 from urllib.parse import parse_qs, urlencode, urlsplit
-from zoneinfo import ZoneInfo
 
 import transport
 
@@ -14,20 +12,8 @@ HOST = transport.API_HOSTS["YouTube"]
 UPLOAD_PATH = "/upload/youtube/v3/videos"
 VIDEO_ID = re.compile(r"[A-Za-z0-9_-]{11}")
 LANGUAGES = {"RU": "ru", "EN": "en", "ESP": "es"}
-LIMIT_REASONS = {
-    "dailyLimitExceeded", "quotaExceeded", "rateLimitExceeded", "uploadLimitExceeded",
-    "userRateLimitExceeded", "tooManyRequests",
-}
 MUTABLE_STATUS = ("license", "embeddable", "publicStatsViewable", "selfDeclaredMadeForKids", "containsSyntheticMedia")
-
-
-class SlotUnavailable(transport.ConnectionProblem):
-    """A definitive rejection due to rate, account or API capacity."""
-
-    def __init__(self, message, *, reason=None, retry_after_seconds=300):
-        super().__init__(message)
-        self.reason = reason
-        self.retry_after_seconds = retry_after_seconds
+SlotUnavailable = transport.YouTubeCapacityProblem
 
 
 class PublishUncertain(transport.ConnectionProblem):
@@ -97,44 +83,6 @@ def upload_metadata(title, description, tags, lang, publish_at, license, made_fo
     return json.dumps({"snippet": snippet, "status": status}, ensure_ascii=False).encode()
 
 
-def retry_delay(reason, headers):
-    current = datetime.now(timezone.utc)
-    retry_after = next((value for key, value in headers.items() if key.lower() == "retry-after"), None)
-    if retry_after:
-        try:
-            seconds = int(retry_after) if retry_after.isdecimal() else (
-                parsedate_to_datetime(retry_after) - current).total_seconds()
-            return max(1, min(172800, round(seconds)))
-        except (TypeError, ValueError, OverflowError):
-            pass
-    if reason in ("dailyLimitExceeded", "quotaExceeded"):
-        pacific = ZoneInfo("America/Los_Angeles")
-        next_day = current.astimezone(pacific).date() + timedelta(days=1)
-        resets = datetime.combine(next_day, time.min, tzinfo=pacific)
-        return max(300, round((resets - current).total_seconds()) + 5)
-    return 3600 if reason == "uploadLimitExceeded" else 300
-
-
-def limit_error(status, body, headers):
-    if status not in (400, 403, 429):
-        return
-    try:
-        details = json.loads(body)["error"]["errors"]
-        reason = next((item["reason"] for item in details if item.get("reason") in LIMIT_REASONS), None)
-    except (ValueError, TypeError, AttributeError, KeyError):
-        return
-    if reason:
-        raise SlotUnavailable(f"YouTube временно отклонил запрос ({reason}).", reason=reason,
-                              retry_after_seconds=retry_delay(reason, headers))
-
-
-def retryable_read_or_init(status, body, headers):
-    limit_error(status, body, headers)
-    if status == 429 or 500 <= status < 600:
-        raise SlotUnavailable(f"YouTube временно недоступен (HTTP {status}).",
-                              retry_after_seconds=retry_delay(None, headers))
-
-
 def session_path(response_headers):
     try:
         location = next((value for key, value in response_headers.items() if key.lower() == "location"), "")
@@ -151,7 +99,7 @@ def session_path(response_headers):
 def verify_write_route(route, token, expected_channel):
     try:
         transport.verify_youtube_write_route(route, token, expected_channel)
-    except transport.RouteProblem:
+    except (transport.RouteProblem, SlotUnavailable):
         raise
     except transport.ConnectionProblem as error:
         raise UploadRejected(str(error)) from error
@@ -201,7 +149,7 @@ def upload(route, token, *, title, description, tags, lang, path, publish_at=Non
             raise transport.RouteProblem(str(error)) from error
         except transport.ConnectionProblem as error:
             raise UploadRejected(str(error)) from error
-        retryable_read_or_init(code, data, response_headers)
+        transport.check_youtube_capacity(code, data, response_headers, retry_transient=True)
         session = session_path(response_headers) if code in (200, 201) else None
         if session is None:
             raise UploadRejected(f"YouTube не открыл сессию загрузки (HTTP {code}).")
@@ -215,7 +163,7 @@ def upload(route, token, *, title, description, tags, lang, path, publish_at=Non
             code = None
     identifier = None
     if code is not None:
-        limit_error(code, body, response_headers)
+        transport.check_youtube_capacity(code, body, response_headers)
         identifier = upload_result_id(code, body)
     if identifier is None and (code is None or 200 <= code < 300 or code == 308 or code >= 500):
         identifier = check_upload_result(route, auth, session, size)
@@ -228,7 +176,7 @@ def read(route, token, resource, **query):
     status, headers, body = transport.request(
         route, HOST, "GET", f"/youtube/v3/{resource}?" + urlencode(query),
         {"Authorization": f"Bearer {token}"})
-    retryable_read_or_init(status, body, headers)
+    transport.check_youtube_capacity(status, body, headers, retry_transient=True)
     return transport.json_response(status, body, "Проверка расписания YouTube")
 
 
@@ -326,7 +274,7 @@ def reschedule(route, token, video_id, publish_at, *, expected_channel=None):
         code, response_headers, data = transport.request(route, HOST, "PUT", "/youtube/v3/videos?part=status", headers, body)
     except transport.ConnectionProblem as error:
         raise ScheduleUncertain("YouTube не подтвердил перенос. Проверьте текущее расписание.") from error
-    limit_error(code, data, response_headers)
+    transport.check_youtube_capacity(code, data, response_headers)
     if 400 <= code < 500:
         raise UploadRejected(f"YouTube отклонил перенос (HTTP {code}). Проверьте доступ OAuth и дату.")
     try:

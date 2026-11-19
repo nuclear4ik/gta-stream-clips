@@ -77,6 +77,13 @@ class PublishingTests(unittest.TestCase):
         return {video: {"privacyStatus": "private", "publishAt": studio.iso(planned),
                         "uploadStatus": "processed"} for video in ids}
 
+    def connect_next(self):
+        self.s.add_account(dict(lang="RU", platform="YouTube", name="Second RU", route="server",
+                                target="UC" + "n" * 22))
+        with self.s.db() as db:
+            return db.execute("""UPDATE accounts SET auto=1,refresh_token='second'
+                WHERE name='Second RU' RETURNING id""").fetchone()[0]
+
     def test_language_dedup_and_preflight_failure(self):
         self.assertEqual([(q["lang"], q["status"]) for q in self.s.snapshot()["queue"]], [("RU", "scheduled")])
         self.prepare.side_effect = transport.ConnectionProblem("wrong region")
@@ -213,7 +220,7 @@ class PublishingTests(unittest.TestCase):
                                                    studio.iso(first + timedelta(minutes=30 * index))))
         request = {"id": draft["id"], "at": first.astimezone(schedule.ZONES["RU"]).strftime("%Y-%m-%dT%H:%M")}
         self.s.queue_action(request | {"action": "save"})
-        with self.assertRaisesRegex(ValueError, "10 роликов"):
+        with self.assertRaisesRegex(ValueError, "лимит канала"):
             self.s.queue_action(request | {"action": "send"})
 
     def test_new_broadcaster_approval_uses_existing_render_without_account_toggle(self):
@@ -287,6 +294,65 @@ class PublishingTests(unittest.TestCase):
         self.assertEqual(tuple(waiting), ("scheduled", studio.iso(self.clock + timedelta(seconds=90)), None))
         self.s.publish_one()
         self.upload.assert_called_once()
+
+    def test_primary_fills_its_day_before_assigning_new_clip_to_second_channel(self):
+        primary = self.s.snapshot()["queue"][0]["account_id"]
+        first = self.s.snapshot()["queue"][0]["id"]
+        noon = self.clock.replace(hour=12)
+        self.set_time(first, noon)
+        backup = self.connect_next()
+        with patch.dict(os.environ, {"STREAMCUT_YOUTUBE_DAILY_LIMIT": "2"}):
+            second = self.add_pending("Основной", noon + timedelta(minutes=30))
+            third = self.add_pending("Запасной", noon)
+        assignments = {job["id"]: job["account_id"] for job in self.s.snapshot()["queue"]}
+        self.assertEqual(assignments, {first: primary, second: primary, third: backup})
+
+    def test_configured_remote_capacity_moves_only_unsent_automatic_job(self):
+        item = self.s.snapshot()["queue"][0]
+        backup = self.connect_next()
+        self.slots.side_effect = lambda _route, _token, channel, _limit: (
+            {OTHER_VIDEO: studio.iso(self.clock + timedelta(hours=8))}
+            if channel == "UC" + "r" * 22 else {})
+        self.status.side_effect = self.confirm_last_upload
+        with patch.object(studio.Studio, "schedule_limit", return_value=1):
+            self.s.publish_one()
+            self.upload.assert_not_called()
+            moved = self.s.snapshot()["queue"][0]
+            self.assertEqual((moved["id"], moved["account_id"], moved["status"]),
+                             (item["id"], backup, "scheduled"))
+            self.s.publish_one()
+        self.upload.assert_called_once()
+        self.assertEqual(self.upload.call_args.kwargs["expected_channel"], "UC" + "n" * 22)
+        self.assertEqual(self.s.snapshot()["queue"][0]["status"], "preloaded")
+
+    def test_google_channel_limit_does_not_move_the_rejected_upload(self):
+        first = self.s.snapshot()["queue"][0]
+        self.connect_next()
+        self.upload.side_effect = youtube_release.SlotUnavailable(
+            "channel upload limit", reason="uploadLimitExceeded", retry_after_seconds=90)
+        self.s.publish_one()
+        self.s.publish_one()
+        self.upload.assert_called_once()
+        item = self.s.snapshot()["queue"][0]
+        self.assertEqual((item["id"], item["account_id"], item["status"]),
+                         (first["id"], first["account_id"], "scheduled"))
+
+    def test_project_quota_blocks_new_jobs_and_preserves_existing_inflight_state(self):
+        primary = self.s.snapshot()["queue"][0]["account_id"]
+        backup = self.connect_next()
+        first = self.s.snapshot()["queue"][0]["id"]
+        self.s.upload_status(first, "sending")
+        self.s.slot_wait(primary, 90, "project quota", project_wide=True)
+        self.assertEqual(self.s.snapshot()["queue"][0]["status"], "sending")
+        created = self.add_pending("После квоты", self.clock + timedelta(hours=7))
+        with self.s.db() as db:
+            db.execute("UPDATE queue SET account_id=? WHERE id=?", (backup, created))
+        self.s.publish_one()
+        self.upload.assert_not_called()
+        self.clock += timedelta(seconds=91)
+        self.s.publish_one()
+        self.upload.assert_called_once()
+        self.assertEqual(self.upload.call_args.kwargs["expected_channel"], "UC" + "n" * 22)
 
     def test_reschedule_changes_remote_publication_and_keeps_video_identity(self):
         identifier = self.s.snapshot()["queue"][0]["id"]

@@ -20,6 +20,9 @@ VOD = {"kind": "vod", "url": "https://www.twitch.tv/videos/10", "archive_id": "1
        "observed": (CURRENT - timedelta(hours=2)).isoformat()}
 ENV = {"TWITCH_CLIENT_ID": "test", "STREAMCUT_TWITCH_CLIP_TOKEN_11": "protected-token",
        "STREAMCUT_TWITCH_CLIP_EDITOR_ID_11": "15"}
+APP_ENV = {"TWITCH_CLIENT_ID": "test", "TWITCH_CLIENT_SECRET": "test-secret",
+           "STREAMCUT_TWITCH_CLIP_EDITOR_ID_11": "15"}
+APP_HEADERS = {"Client-Id": "test", "Authorization": "Bearer app-token"}
 CDN = "production.assets.clips.twitchcdn.net"
 FILE = b"\x00\x00\x00\x18ftypisom" + b"\x00" * 20
 
@@ -89,9 +92,9 @@ class TwitchMediaTests(unittest.TestCase):
         downloads = [{"clip_id": "other", "landscape_download_url": "https://unrelated.invalid/mp4"},
                      {"clip_id": "first", "landscape_download_url": None},
                      {"clip_id": "second", "landscape_download_url": f"https://{CDN}/test.mp4?signature=abc"}]
-        with TemporaryDirectory() as folder, patch.dict(os.environ, ENV, clear=True), patch(
+        with TemporaryDirectory() as folder, patch.dict(os.environ, APP_ENV | ENV, clear=True), patch(
                 "discovery.helix", side_effect=[rows, downloads]) as helix, patch(
-                "twitch_media.HTTPSConnection") as connect:
+                "discovery.twitch_headers") as app_token, patch("twitch_media.HTTPSConnection") as connect:
             target = Path(folder) / "twitch-vod-10.mp4"
             connection = connect.return_value
             connection.getresponse.return_value = FakeResponse(FILE, str(len(FILE)))
@@ -107,9 +110,61 @@ class TwitchMediaTests(unittest.TestCase):
                 ("broadcaster_id", "11"), ("editor_id", "15"), ("clip_id", "first"), ("clip_id", "second"),
             ])
             self.assertEqual(helix.call_args.args[2]["Authorization"], "Bearer protected-token")
+            app_token.assert_not_called()
             connect.assert_called_once_with(CDN, timeout=20)
             connection.request.assert_called_once_with("GET", "/test.mp4?signature=abc")
             connection.close.assert_called_once()
+
+    def test_app_token_uses_client_credentials_and_explicit_editor(self):
+        with TemporaryDirectory() as folder, patch.dict(os.environ, APP_ENV, clear=True), patch(
+                "discovery.twitch_headers", return_value=APP_HEADERS) as app_token, patch(
+                "discovery.helix", side_effect=[
+                    [clip("selected")],
+                    [{"clip_id": "selected", "landscape_download_url": f"https://{CDN}/selected.mp4"}],
+                ]) as helix, patch("twitch_media.HTTPSConnection") as connect:
+            target = Path(folder) / "twitch-vod-10.mp4"
+            self.assertTrue(twitch_media.configured())
+            self.assertTrue(twitch_media.configured(VOD))
+            self.assertFalse(twitch_media.configured(VOD | {"twitch_user": "21"}))
+            connect.return_value.getresponse.return_value = FakeResponse(FILE, str(len(FILE)))
+            self.assertEqual(twitch_media.fetch(VOD, target, current=CURRENT), target)
+            self.assertEqual(target.read_bytes(), FILE)
+            app_token.assert_called_once_with("test", "test-secret")
+            self.assertEqual([call.args[2] for call in helix.call_args_list], [APP_HEADERS, APP_HEADERS])
+            self.assertEqual(helix.call_args.args[1], [
+                ("broadcaster_id", "11"), ("editor_id", "15"), ("clip_id", "selected"),
+            ])
+            connect.return_value.request.assert_called_once_with("GET", "/selected.mp4")
+
+    def test_app_token_requires_a_valid_explicit_actor_and_client_secret(self):
+        bad_settings = [
+            {"TWITCH_CLIENT_ID": "test", "TWITCH_CLIENT_SECRET": "test-secret"},
+            APP_ENV | {"TWITCH_CLIENT_SECRET": ""},
+            APP_ENV | {"STREAMCUT_TWITCH_CLIP_EDITOR_ID_11": "not-a-user-id"},
+        ]
+        with TemporaryDirectory() as folder, patch("discovery.twitch_headers") as app_token, patch(
+                "discovery.helix") as helix, patch("twitch_media.HTTPSConnection") as connect:
+            target = Path(folder) / "missing.mp4"
+            for settings in bad_settings:
+                with patch.dict(os.environ, settings, clear=True):
+                    self.assertFalse(twitch_media.configured())
+                    self.assertFalse(twitch_media.configured(VOD))
+                    self.assertIsNone(twitch_media.fetch(VOD, target, current=CURRENT))
+            app_token.assert_not_called()
+            helix.assert_not_called()
+            connect.assert_not_called()
+
+    def test_app_token_cannot_download_when_twitch_denies_the_actor(self):
+        with TemporaryDirectory() as folder, patch.dict(os.environ, APP_ENV, clear=True), patch(
+                "discovery.twitch_headers", return_value=APP_HEADERS), patch(
+                "discovery.helix", side_effect=(
+                    [clip("selected")], discovery.ConnectionProblem("HTTP 403"),
+                )), patch("twitch_media.HTTPSConnection") as connect:
+            target = Path(folder) / "twitch-vod-10.mp4"
+            with self.assertRaisesRegex(discovery.ConnectionProblem, "HTTP 403"):
+                twitch_media.fetch(VOD, target, current=CURRENT)
+            connect.assert_not_called()
+            self.assertFalse(target.exists())
 
     def test_expired_clip_url_does_not_starve_the_next_authorized_clip(self):
         rows = [clip("first", view_count=80), clip("second", view_count=12)]
