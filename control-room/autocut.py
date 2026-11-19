@@ -21,6 +21,7 @@ WINDOW_SECONDS = 120
 WINDOW_CONTEXT_SECONDS = 6
 MIN_CLIP_SECONDS = 25
 MAX_CLIP_SECONDS = 50
+MAX_ALTERNATE_VAD_SECONDS = 90
 MAX_SOURCE_SECONDS = 24 * 60 * 60
 CAMERA_SAMPLE_POSITIONS = (.08, .24, .45, .68, .88)
 MIN_CAMERA_HITS = 4
@@ -91,7 +92,7 @@ def transcription(model, samples, lang, start, duration, *, vad):
     return captions
 
 
-def transcribe_recording(video, recording, model, lang):
+def transcribe_recording(video, recording, model, lang, *, prefer_vad=True):
     captions = []
     chunks = iter(analysis_windows(recording.duration))
     with ThreadPoolExecutor(max_workers=1) as decoder:
@@ -109,9 +110,9 @@ def transcribe_recording(video, recording, model, lang):
             current = read_chunk(following) if following is not None else None
             if samples.size < 8000:
                 continue
-            window = transcription(model, samples, lang, start, length, vad=True)
+            window = transcription(model, samples, lang, start, length, vad=prefer_vad)
             spoken = sum(cue.end - cue.start for cue in window)
-            if spoken < 2:
+            if prefer_vad and spoken < 2:
                 # Quiet streamer microphones can be missed by the speech activity filter.
                 retry = transcription(model, samples, lang, start, length, vad=False)
                 if sum(cue.end - cue.start for cue in retry) > spoken:
@@ -383,10 +384,18 @@ def prepare(video: Path, lang: str, title: str, limit: int) -> dict:
             limit=moment_model.MAX_ARCHIVE_MOMENTS, archive=True,
         )
     except ValueError as model_error:
-        moments = moment_model.fallback_moments(
-            captions, lang, minimum=MIN_CLIP_SECONDS, maximum=MAX_CLIP_SECONDS,
-            limit=moment_model.MAX_ARCHIVE_MOMENTS,
-        )
+        options = {"minimum": MIN_CLIP_SECONDS, "maximum": MAX_CLIP_SECONDS,
+                   "limit": moment_model.MAX_ARCHIVE_MOMENTS}
+        moments = moment_model.fallback_moments(captions, lang, **options)
+        if not moments and recording.duration <= MAX_ALTERNATE_VAD_SECONDS:
+            # VAD can merge or cut short connected turns. Try one alternate segmentation.
+            try:
+                alternate = transcribe_recording(video, recording, model, LANGUAGES[lang], prefer_vad=False)
+            except ValueError:
+                alternate = []
+            moments = moment_model.fallback_moments(alternate, lang, **options)
+            if moments:
+                srt = as_srt(alternate)
         if not moments:
             raise ValueError("В записи нет завершённых фрагментов с речью длительностью 25–50 секунд.") from model_error
     maximum = min(MAX_SOURCE_SECONDS, math.floor(recording.duration * 1000) / 1000)

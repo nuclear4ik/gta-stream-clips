@@ -193,6 +193,15 @@ class PublishingTests(unittest.TestCase):
             self.assertEqual(self.s.ready_counts(db)["RU"], 0)
         self.assertEqual([item["status"] for item in self.s.snapshot()["queue"]], ["cancelled"])
 
+    def test_rejected_job_releases_inventory_but_an_uncertain_upload_does_not(self):
+        job = self.s.snapshot()["queue"][0]
+        self.s.upload_status(job["id"], "unknown")
+        self.assertEqual(self.s.snapshot()["queue_counts"]["RU"], 1)
+        self.s.upload_status(job["id"], "blocked")
+        self.assertEqual(self.s.snapshot()["queue_counts"]["RU"], 0)
+        self.s.publish_one()
+        self.upload.assert_not_called()
+
     def test_sync_checks_confirmed_uploads_after_first_hundred(self):
         job = self.s.snapshot()["queue"][0]
         moment = studio.iso(self.clock + timedelta(hours=1))

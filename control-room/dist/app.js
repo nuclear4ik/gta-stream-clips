@@ -200,10 +200,11 @@
     const current = item => !filter || item.lang === filter;
     const assigned = new Set(jobs.map(job => job.clip_id));
     const unassigned = data.clips?.filter(clip => !assigned.has(clip.id)) || [];
-    const backlog = jobs.filter(job => !['uploaded', 'cancelled', 'preloaded'].includes(job.status));
+    const finished = ['uploaded', 'cancelled', 'blocked'];
+    const backlog = jobs.filter(job => job.status !== 'preloaded' && !finished.includes(job.status));
     const scheduled = jobs.filter(job => job.status === 'preloaded' && current(job))
       .sort((a, b) => Date.parse(jobTime(a)) - Date.parse(jobTime(b)));
-    const history = jobs.filter(job => ['uploaded', 'cancelled'].includes(job.status) && current(job));
+    const history = jobs.filter(job => finished.includes(job.status) && current(job));
     const waiting = queueRows(backlog.filter(current), unassigned.filter(current));
     const localLimit = lang => (!data.strict_ru_sources || lang === 'RU') &&
       Number.isInteger(data.inventory_limit) && data.inventory_limit > 0 ? data.inventory_limit : null;

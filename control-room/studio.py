@@ -340,7 +340,8 @@ class Studio:
             queue = [dict(row) for row in db.execute("""SELECT q.id, q.clip_id, q.at, q.status, q.detail,
                        q.external_id, q.account_id, c.title, c.lang, a.name AS account, a.platform
                        FROM queue q JOIN clips c ON c.id=q.clip_id JOIN accounts a ON a.id=q.account_id
-                       ORDER BY CASE WHEN q.status IN ('uploaded','cancelled') THEN 1 ELSE 0 END, q.at LIMIT 500""")]
+                       ORDER BY CASE WHEN q.status IN ('uploaded','cancelled','blocked') THEN 1 ELSE 0 END,
+                           q.at LIMIT 500""")]
         return {"live": True, "settings": settings, "sources": visible_sources, "accounts": accounts,
                 "connections": self.connection_snapshot(checks), "queue_counts": queue_counts,
                 "inventory_limit": self.inventory_limit(),
@@ -375,7 +376,7 @@ class Studio:
         verified = "AND c.lang='RU' AND c.verified=1" if cls.inventory_limit() == RU_INVENTORY_LIMIT else ""
         result.update(db.execute(f"""SELECT c.lang,count(*) FROM clips c WHERE NOT EXISTS (
             SELECT 1 FROM queue q JOIN accounts a ON a.id=q.account_id WHERE q.clip_id=c.id
-            AND a.platform='YouTube' AND q.status IN ('preloaded','uploaded','cancelled')
+            AND a.platform='YouTube' AND q.status IN ('preloaded','uploaded','cancelled','blocked')
         ) {verified} GROUP BY c.lang""").fetchall())
         return result
 

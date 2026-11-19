@@ -157,6 +157,25 @@ class AutoCutTests(unittest.TestCase):
             with self.assertRaises(reaction.MissingReactionProfile):
                 autocut.prepare(self.video, "RU", "GTA VI", 1)
 
+    def test_short_input_retries_without_vad_and_uses_that_pass_for_subtitles(self):
+        partial = [autocut.Caption(0, 9, "Сначала проедем по трассе."),
+                   autocut.Caption(13, 33, "А потом мы неожиданно…")]
+        complete = [autocut.Caption(0, 8, "Вот это резкий поворот!"),
+                    autocut.Caption(9, 18, "Погоня продолжилась прямо под мостом."),
+                    autocut.Caption(19, 36, "Хорошо, что мы всё-таки успели от неё оторваться.")]
+        with patch.object(autocut, "probe", return_value=self.recording), \
+             patch.object(autocut, "configured_layout", return_value={"facecam": "0%,0%,22%,26%"}), \
+             patch.object(autocut, "whisper_model"), \
+             patch.object(autocut, "transcribe_recording", side_effect=[partial, complete]) as transcribed, \
+             patch.object(autocut.moment_model, "select_moments", side_effect=ValueError("No complete highlight")), \
+             patch.object(autocut, "speech_languages", return_value=[{"code": "ru", "confidence": .98}]):
+            result = autocut.prepare(self.video, "RU", "GTA VI", 20)
+        self.assertEqual([call.kwargs for call in transcribed.call_args_list], [{}, {"prefer_vad": False}])
+        self.assertEqual(result["moments"], [{"start_seconds": 0, "end_seconds": 36,
+                                             "headline": "Вот это резкий поворот"}])
+        self.assertIn("Погоня продолжилась прямо под мостом.", result["transcript"])
+        self.assertNotIn("А потом мы неожиданно", result["transcript"])
+
     def test_detected_audio_must_agree_across_selected_intervals(self):
         intervals = [{"start_seconds": 0, "end_seconds": 30}, {"start_seconds": 32, "end_seconds": 62}]
         results = [("ru", .99, []), ("ru", .82, []), ("es", .96, []), ("en", .97, [])]

@@ -184,6 +184,22 @@ test('strict RU Sources hides inaccessible discoveries and keeps manual and read
   assert.match(app.innerHTML, /Клип в расписании/);
 });
 
+test('Sources explains why fresh Twitch results are not in the editing queue', async () => {
+  const {app, navigate} = await panel(() => assert.fail('local display only'), {
+    strict_ru_sources: true,
+    search_configured: true,
+    ranking_updated: {RU: '2026-11-19T08:00:00+00:00'},
+    source_health: {archives: 63, accessible: 0, active: 0},
+    queue_counts: {RU: 30, EN: 0, ESP: 0},
+    inventory_limit: 30,
+  });
+  assert.match(app.innerHTML, /Новых записей: 63 · настроено получение: 0 · в обработке: 0/);
+  assert.match(app.innerHTML, /Для монтажа нужен доступ к файлу/);
+  navigate('queue');
+  assert.match(app.innerHTML, /Локальный запас: 30 из 30/);
+  assert.doesNotMatch(app.innerHTML, /Локальный запас: 0 из 30/);
+});
+
 test('Sources shows only Russian media and rankings while Queue keeps other languages', async () => {
   const languages = [
     ['RU', 'Городской эфир', 'Первый русский клип', 'Быстрый стример'],
