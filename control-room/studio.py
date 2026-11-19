@@ -43,6 +43,8 @@ CHANNEL_RE = re.compile(r"UC[A-Za-z0-9_-]{22}")
 INVENTORY_LIMIT = 10
 PUBLISH_LEAD = timedelta(minutes=15)
 TWITCH_DISCOVERY_INTERVAL = timedelta(minutes=30)
+RESERVING_QUEUE_STATES = ("scheduled", "route_wait", "checking", "sending", "unknown",
+                          "remote_check", "preloaded", "uploaded")
 TWITCH_FILE_PENDING = "Автоматическое получение пока не вернуло файл. Сервис проверит запись снова."
 TWITCH_FILE_ERROR = "Проверьте доступ к записи и соединение. Сервис повторит попытку."
 
@@ -348,7 +350,7 @@ class Studio:
         result = dict.fromkeys(LANGS, 0)
         result.update(db.execute("""SELECT c.lang,count(*) FROM clips c WHERE NOT EXISTS (
             SELECT 1 FROM queue q JOIN accounts a ON a.id=q.account_id WHERE q.clip_id=c.id
-            AND a.platform='YouTube' AND q.status IN ('preloaded','uploaded')
+            AND a.platform='YouTube' AND q.status IN ('preloaded','uploaded','cancelled')
         ) GROUP BY c.lang""").fetchall())
         return result
 
@@ -1046,11 +1048,15 @@ class Studio:
                        (clip_id, account_id, slot, state, None if review else 1))
 
     @staticmethod
+    def reserved_dates(db, account, exclude=None):
+        placeholders = ",".join("?" for _ in RESERVING_QUEUE_STATES)
+        return [datetime.fromisoformat(row["at"]) for row in db.execute(
+            f"SELECT at FROM queue WHERE account_id=? AND id IS NOT ? AND status IN ({placeholders})",
+            (account, exclude, *RESERVING_QUEUE_STATES))]
+
+    @staticmethod
     def next_slot(db, account, lang, after, exclude=None):
-        reserved = [datetime.fromisoformat(r["at"]) for r in db.execute(
-            "SELECT at FROM queue WHERE account_id=? AND status!='cancelled' AND id IS NOT ?",
-            (account, exclude))]
-        return iso(schedule.available_slot(after, lang, reserved))
+        return iso(schedule.available_slot(after, lang, Studio.reserved_dates(db, account, exclude)))
 
     def queue_action(self, data):
         identifier, action = data.get("id"), data.get("action")
@@ -1075,12 +1081,6 @@ class Studio:
             planned = schedule.local_time(text_field(data, "at", 16), job["lang"])
             if planned <= now():
                 raise ValueError("Выберите время в будущем.")
-            start, end = schedule.civil_day(planned, job["lang"])
-            total = db.execute("""SELECT count(*) FROM queue WHERE account_id=? AND id!=?
-                AND status!='cancelled' AND at>=? AND at<?""",
-                               (job["account_id"], identifier, iso(start), iso(end))).fetchone()[0]
-            if total >= schedule.DAY_LIMIT:
-                raise ValueError("На эти сутки уже запланировано 10 роликов для аккаунта.")
             if action == "send":
                 if (job["platform"] != "YouTube" or job["lang"] != "RU" or
                         not job["connected"] or not self.uploads_enabled()):
@@ -1090,6 +1090,11 @@ class Studio:
                 state = job["status"] if job["status"] in ("scheduled", "route_wait") else "review"
             else:
                 raise ValueError("Неизвестное действие.")
+            if state in RESERVING_QUEUE_STATES:
+                start, end = schedule.civil_day(planned, job["lang"])
+                total = sum(start <= date < end for date in self.reserved_dates(db, job["account_id"], identifier))
+                if total >= schedule.DAY_LIMIT:
+                    raise ValueError("На эти сутки уже запланировано 10 роликов для аккаунта.")
             automatic = 0 if action == "send" else job["auto_scheduled"]
             db.execute("UPDATE queue SET at=?,status=?,detail='',retry_at=NULL,auto_scheduled=? WHERE id=?",
                        (iso(planned), state, automatic, identifier))
@@ -1264,10 +1269,12 @@ class Studio:
         with self.db() as db:
             jobs = db.execute("""SELECT id,account_id,status,external_id FROM queue
                 WHERE external_id IS NOT NULL AND status IN ('remote_check','preloaded')
-                ORDER BY CASE WHEN status='remote_check' THEN 0 ELSE 1 END,at LIMIT 100""").fetchall()
-        for account_id in {job["account_id"] for job in jobs}:
+                ORDER BY CASE WHEN status='remote_check' THEN 0 ELSE 1 END,at""").fetchall()
+        by_account = {}
+        for job in jobs:
+            by_account.setdefault(job["account_id"], []).append(job)
+        for account_id, pending in by_account.items():
             account = self.get_account(account_id)
-            pending = [job for job in jobs if job["account_id"] == account_id]
             if not account["refresh_token"]:
                 continue
             try:

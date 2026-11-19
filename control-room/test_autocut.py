@@ -30,9 +30,10 @@ class AutoCutTests(unittest.TestCase):
     def test_transcribes_middle_and_tail_once_with_context_at_boundaries(self):
         recording = Recording(265, 0, 1, 1920, 1080)
         crossing = autocut.Caption(116, 122, "Вот и встретились.")
+        shifted = autocut.Caption(118, 124, "Вот и встретились!")
         middle = autocut.Caption(173, 180, "Началась погоня.")
         tail = autocut.Caption(257, 262, "Мы оторвались от них.")
-        cues = {0: [crossing], 114: [crossing, middle], 234: [tail]}
+        cues = {0: [crossing], 114: [shifted, middle], 234: [tail]}
         with patch.object(autocut, "audio_samples", return_value=SimpleNamespace(size=16000)) as audio, \
              patch.object(autocut, "transcription", side_effect=lambda *args, **kw: cues[args[3]]):
             result = autocut.transcribe_recording(self.video, recording, Mock(), "ru")

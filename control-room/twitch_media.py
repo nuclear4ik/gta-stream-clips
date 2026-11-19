@@ -190,7 +190,13 @@ def fetch(candidate, destination, *, current=None):
     links = discovery.helix("clips/downloads", [("broadcaster_id", broadcaster), ("editor_id", editor),
                             *(("clip_id", value) for value in ids)], headers, "Разрешение на скачивание Twitch")
     landscape = {link.get("clip_id"): link.get("landscape_download_url") for link in links}
+    failure = None
     for clip_id in ids:
         if raw_url := landscape.get(clip_id):
-            return download(raw_url, destination)
+            try:
+                return download(raw_url, destination)
+            except discovery.ConnectionProblem as error:
+                failure = error
+    if failure is not None:
+        raise failure
     return None

@@ -216,7 +216,7 @@ def twitch_markets(languages, current, known_live, known_channels=None, *, live_
         if live_only:
             continue
         for uid, login in watched:
-            rows = d.helix("videos", [("user_id", uid), ("type", "archive"), ("first", 5),
+            rows = d.helix("videos", [("user_id", uid), ("language", code), ("type", "archive"), ("first", 5),
                                      ("sort", "time")], headers, "Записи Twitch")
             for item in rows:
                 if item.get("user_id") == uid and (found := twitch_item(

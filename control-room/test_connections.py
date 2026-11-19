@@ -8,6 +8,18 @@ import transport
 
 
 class ConnectionsTest(unittest.TestCase):
+    def test_temporary_oauth_failure_waits_but_expired_credentials_require_action(self):
+        account = {"route": "server", "platform": "YouTube", "refresh_token": "fixture"}
+        env = {"STREAMCUT_GOOGLE_CLIENT_ID": "fixture", "STREAMCUT_GOOGLE_CLIENT_SECRET": "fixture"}
+        with patch.dict(os.environ, env), patch("transport.check_route"), patch("transport.request") as request:
+            request.return_value = (503, {}, b"")
+            with self.assertRaises(transport.RouteProblem):
+                transport.prepare_upload(account)
+            request.return_value = (400, {}, b'{"error":"invalid_grant"}')
+            with self.assertRaises(transport.ConnectionProblem) as error:
+                transport.prepare_upload(account)
+            self.assertNotIsInstance(error.exception, transport.RouteProblem)
+
     def test_gateway_diagnostics_use_platform_tls_without_geolocation(self):
         with patch.dict(os.environ, {"STREAMCUT_UPLOAD_GATEWAY": "http://trusted.example"}), patch(
             "transport.request", return_value=(403, {}, b"")

@@ -94,11 +94,38 @@ class YouTubeReleaseTests(unittest.TestCase):
                 self.upload()
             self.assertEqual(raised.exception.retry_after_seconds, 90)
         with patch("transport.request", side_effect=[
-            (200, SESSION, b""), transport.ConnectionProblem("Connection timed out"),
+            (200, SESSION, b""), transport.ConnectionProblem("Connection timed out"), (308, {}, b""),
         ]) as request:
             with self.assertRaises(youtube.PublishUncertain):
                 self.upload()
-            self.assertEqual(request.call_count, 2)
+            self.assertEqual(request.call_count, 3)
+
+    def test_direct_metadata_connection_failure_and_server_error_are_retryable(self):
+        with patch("transport.request", side_effect=transport.NetworkProblem("timeout")) as request:
+            with self.assertRaises(transport.RouteProblem):
+                self.upload()
+            self.assertEqual(request.call_args.args[:3], ("server", HOST, "POST"))
+            request.assert_called_once()
+        with patch("transport.request", return_value=(503, {"Retry-After": "44"}, b"")) as request:
+            with self.assertRaises(youtube.SlotUnavailable) as raised:
+                self.upload()
+            self.assertEqual(raised.exception.retry_after_seconds, 44)
+            with self.assertRaises(youtube.SlotUnavailable):
+                youtube.scheduled_entries("server", "token", CHANNEL, 10)
+            self.assertEqual([call.args[2] for call in request.call_args_list], ["POST", "GET"])
+
+    def test_lost_media_response_recovers_id_without_resending_the_file(self):
+        replies = [
+            (200, SESSION, b""), transport.NetworkProblem("response lost"), response(201, {"id": VIDEO}),
+        ]
+        with patch("transport.request", side_effect=replies) as request:
+            self.assertEqual(self.upload(), VIDEO)
+        initial, media, check = request.call_args_list
+        self.assertEqual(initial.args[2], "POST")
+        self.assertEqual(media.args[:4], check.args[:4])
+        self.assertEqual(check.args[4], {"Authorization": "Bearer fixture-token", "Content-Length": "0",
+                                         "Content-Range": f"bytes */{self.video_path.stat().st_size}"})
+        self.assertEqual(len(check.args), 5)
 
     def test_strict_gateway_rejects_direct_upload_and_reschedule(self):
         os.environ["STREAMCUT_YOUTUBE_REQUIRE_GATEWAY"] = "1"
@@ -125,11 +152,11 @@ class YouTubeReleaseTests(unittest.TestCase):
                 self.upload("gateway", expected_channel=CHANNEL)
             self.assertEqual([call.args[2] for call in request.call_args_list], ["GET", "POST", "GET"])
         with patch("transport.request", side_effect=[
-            correct, opened, correct, transport.NetworkProblem("response lost"),
+            correct, opened, correct, transport.NetworkProblem("response lost"), (308, {}, b""),
         ]) as request:
             with self.assertRaises(youtube.PublishUncertain):
                 self.upload("gateway", expected_channel=CHANNEL)
-            self.assertEqual([call.args[2] for call in request.call_args_list], ["GET", "POST", "GET", "PUT"])
+            self.assertEqual([call.args[2] for call in request.call_args_list], ["GET", "POST", "GET", "PUT", "PUT"])
             self.assertTrue(all(call.args[:2] == ("gateway", HOST) for call in request.call_args_list))
 
     def test_schedule_counts_only_pending_private_uploads_on_the_verified_channel(self):
@@ -146,6 +173,41 @@ class YouTubeReleaseTests(unittest.TestCase):
                              {VIDEO: start.replace("Z", "+00:00")})
         self.assertIn("mine=true", mocked.call_args_list[0].args[3])
         self.assertIn("pageToken=page2", mocked.call_args_list[3].args[3])
+
+    def test_schedule_scan_reaches_older_uploads_without_looping_bad_page_tokens(self):
+        channel = {"items": [{"id": CHANNEL, "contentDetails": {"relatedPlaylists": {"uploads": "UU-fixture"}}}]}
+        with patch.object(youtube, "read") as read:
+            planned = later(3).isoformat()
+            listing = {"items": [{"contentDetails": {"videoId": VIDEO}}]}
+            status = {"items": [{"id": VIDEO, "status": {"privacyStatus": "private", "publishAt": planned}}]}
+            read.side_effect = [channel, *({"nextPageToken": str(i)} for i in range(10)), listing, status]
+            self.assertEqual(youtube.scheduled_entries("server", "token", CHANNEL, 10), {VIDEO: planned})
+            self.assertEqual(read.call_count, 13)
+        with patch.object(youtube, "read", side_effect=[
+            channel, {"nextPageToken": "loop"}, {"nextPageToken": "loop"},
+        ]) as read:
+            with self.assertRaisesRegex(transport.ConnectionProblem, "некорректную страницу"):
+                youtube.scheduled_entries("server", "token", CHANNEL, 10)
+            self.assertEqual(read.call_count, 3)
+
+    def test_incomplete_video_status_cannot_count_as_an_available_slot(self):
+        for status in ({}, {"privacyStatus": "private", "publishAt": "bad-date"}):
+            with patch.object(youtube, "read", return_value={"items": [{"id": VIDEO, "status": status}]}):
+                with self.assertRaisesRegex(transport.ConnectionProblem, "неполный статус"):
+                    youtube.publication_status("server", "token", [VIDEO])
+
+    def test_reschedule_revalidates_the_date_after_gateway_verification(self):
+        previous = later(2)
+        passed_during_verification = later(1)
+        published = {"privacyStatus": "private", "publishAt": previous.isoformat()}
+        with patch.object(youtube, "publication_status", return_value={VIDEO: published}), patch.object(
+            youtube, "future_publication", side_effect=[passed_during_verification, youtube.UploadRejected("past")],
+        ) as future, patch.object(youtube, "verify_write_route") as verify, patch("transport.request") as request:
+            with self.assertRaises(youtube.UploadRejected):
+                youtube.reschedule("server", "token", VIDEO, passed_during_verification)
+            self.assertEqual(future.call_count, 2)
+            verify.assert_called_once()
+            request.assert_not_called()
 
     def test_remote_schedule_move_preserves_metadata_and_requires_confirmation(self):
         previous = later(1).isoformat()

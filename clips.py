@@ -213,25 +213,38 @@ def select_highlights(candidates, duration, options):
     return selected
 
 
-def ffmpeg_excerpt(source, item):
-    return [*FFMPEG, "-ss", f"{item.start:.3f}", "-i", str(source)]
+def decode_stream(source, start, stream_index, options):
+    try:
+        result = subprocess.run([
+            *FFMPEG, "-ss", f"{start:.3f}", "-i", str(source), "-map", f"0:{stream_index}", *options, "-"
+        ], capture_output=True, timeout=160)
+    except subprocess.TimeoutExpired as error:
+        raise RuntimeError("FFmpeg не успел прочитать фрагмент записи.") from error
+    if result.returncode:
+        detail = result.stderr.decode("utf-8", "replace").strip().splitlines()
+        raise RuntimeError(f"FFmpeg не прочитал запись. {detail[-1][:240] if detail else ''}")
+    return result.stdout
 
 
-def duration_args(item):
-    return ["-t", f"{item.end - item.start:.3f}"]
+def audio_samples(source, recording, start, duration):
+    import numpy as np
 
-
-def transcribe(model, source, recording, item, folder, language):
-    wave = folder / "speech.wav"
-    execute([
-        *ffmpeg_excerpt(source, item), "-map", f"0:{recording.audio_index}", *duration_args(item),
-        "-ac", "1", "-ar", "16000", "-c:a", "pcm_s16le", str(wave)
+    # A PCM array lets Whisper share FFmpeg's decoding and bypass its separate PyAV reader.
+    raw = decode_stream(source, start, recording.audio_index, [
+        "-t", f"{duration:.3f}", "-ac", "1", "-ar", "16000", "-f", "f32le",
     ])
+    return np.frombuffer(raw, dtype="<f4")
+
+
+def transcribe(model, source, recording, item, language):
+    duration = item.end - item.start
+    samples = audio_samples(source, recording, item.start, duration)
+    if not samples.size:
+        return [], None
     segments, info = model.transcribe(
-        str(wave), language=language, beam_size=3, vad_filter=True, word_timestamps=True
+        samples, language=language, beam_size=3, vad_filter=True, word_timestamps=True
     )
-    captions = from_transcription(segments, item.start, item.end - item.start)
-    wave.unlink()
+    captions = from_transcription(segments, item.start, duration)
     detected = None
     if language is None and captions:
         detected = {"code": info.language, "confidence": info.language_probability}
@@ -338,7 +351,7 @@ def export(source, recording, highlights, options, camera, game, source_captions
             original_captions, speech_language = source_captions, None
             if model:
                 original_captions, speech_language = transcribe(
-                    model, source, recording, item, folder, options.language
+                    model, source, recording, item, options.language
                 )
             headline = (
                 choose_headline(

@@ -171,6 +171,51 @@ class PublishingTests(unittest.TestCase):
         self.prepare.assert_not_called()
         self.upload.assert_not_called()
 
+    def test_cancelled_item_frees_inventory_and_draft_does_not_hold_slot(self):
+        job = self.s.snapshot()["queue"][0]
+        first = self.clock.replace(hour=12)  # 15:00 in Moscow
+        self.set_time(job["id"], first)
+        with self.s.db() as db:
+            self.assertNotEqual(self.s.next_slot(db, job["account_id"], "RU", self.clock), studio.iso(first))
+            db.execute("UPDATE queue SET status='review' WHERE id=?", (job["id"],))
+            self.assertEqual(self.s.next_slot(db, job["account_id"], "RU", self.clock), studio.iso(first))
+            self.assertEqual(self.s.ready_counts(db)["RU"], 1)
+        self.s.queue_action({"id": job["id"], "action": "cancel"})
+        with self.s.db() as db:
+            self.s.populate(db)
+            self.assertEqual(self.s.ready_counts(db)["RU"], 0)
+        self.assertEqual([item["status"] for item in self.s.snapshot()["queue"]], ["cancelled"])
+
+    def test_sync_checks_confirmed_uploads_after_first_hundred(self):
+        job = self.s.snapshot()["queue"][0]
+        moment = studio.iso(self.clock + timedelta(hours=1))
+        with self.s.db() as db:
+            db.execute("UPDATE queue SET status='preloaded',external_id=? WHERE id=?", (FIRST_VIDEO, job["id"]))
+            for index in range(100):
+                clip = db.execute("INSERT INTO clips(lang,title,relative_path) VALUES ('RU','Клип','clip.mp4')").lastrowid
+                db.execute("""INSERT INTO queue(clip_id,account_id,at,status,external_id)
+                    VALUES (?,?,?,'preloaded',?)""", (clip, job["account_id"], moment, f"v{index:010d}"))
+        self.s.sync_youtube()
+        self.status.assert_called_once()
+        checked = self.status.call_args.args[2]
+        self.assertEqual(len(checked), 101)
+        self.assertIn("v0000000099", checked)
+
+    def test_draft_can_save_a_requested_date_without_reserving_a_full_calendar_day(self):
+        draft = self.s.snapshot()["queue"][0]
+        first = self.clock.replace(hour=12)
+        with self.s.db() as db:
+            db.execute("UPDATE queue SET status='review' WHERE id=?", (draft["id"],))
+            for index in range(schedule.DAY_LIMIT):
+                clip = db.execute("INSERT INTO clips(lang,title,relative_path) VALUES ('RU','Клип','clip.mp4')").lastrowid
+                db.execute("""INSERT INTO queue(clip_id,account_id,at,status)
+                    VALUES (?,?,?,'scheduled')""", (clip, draft["account_id"],
+                                                   studio.iso(first + timedelta(minutes=30 * index))))
+        request = {"id": draft["id"], "at": first.astimezone(schedule.ZONES["RU"]).strftime("%Y-%m-%dT%H:%M")}
+        self.s.queue_action(request | {"action": "save"})
+        with self.assertRaisesRegex(ValueError, "10 роликов"):
+            self.s.queue_action(request | {"action": "send"})
+
     def test_new_broadcaster_approval_uses_existing_render_without_account_toggle(self):
         os.environ[AUTO_SOURCES] = ""
         instant = self.clock + timedelta(hours=3)
@@ -438,16 +483,6 @@ class TransportTests(unittest.TestCase):
             result = transport.check_route("ES", "Reels")
         self.assertEqual(result["country"], "ES")
         self.assertEqual(request.call_args.args, ("ES", "graph.instagram.com", "GET", "/"))
-
-    def test_no_credential_forward_to_unexpected_upload_host(self):
-        with TemporaryDirectory() as directory:
-            path = Path(directory) / "test.mp4"
-            path.write_bytes(b"fixture")
-            reply = (200, {"Location": "https://example.com/upload/session"}, b"")
-            with patch("transport.request", return_value=reply) as request:
-                with self.assertRaises(transport.ConnectionProblem):
-                    transport.upload_private("server", "fixture-token", "Clip", "EN", path)
-            request.assert_called_once()
 
 
 if __name__ == "__main__":

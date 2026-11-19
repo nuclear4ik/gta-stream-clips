@@ -55,16 +55,16 @@ def market_streams(lang, code, game_id, headers, current, *, channels=None):
     return candidates
 
 
-def archive_rows(user, headers):
-    return discovery.helix("videos", [("user_id", user), ("type", "archive"),
+def archive_rows(user, code, headers):
+    return discovery.helix("videos", [("user_id", user), ("language", code), ("type", "archive"),
                                       ("sort", "time"), ("first", ARCHIVES_PER_CHANNEL)],
                             headers, "Записи выбранного канала Twitch")
 
 
-def optional_archive_rows(user, archives, headers):
+def optional_archive_rows(user, code, archives, headers):
     if user not in archives:
         try:
-            archives[user] = archive_rows(user, headers)
+            archives[user] = archive_rows(user, code, headers)
         except discovery.ConnectionProblem:
             archives[user] = []
     return archives[user]
@@ -132,13 +132,13 @@ def qualified_channels(headers):
     return eligible
 
 
-def archive_candidates(channels, archives, headers, current, known_live, game_id, *, active=()):
+def archive_candidates(channels, code, archives, headers, current, known_live, game_id, *, active=()):
     live_channels = {stream["twitch_user"]: stream for stream in active}
     for user, login in channels.items():
         if user in archives:
             continue  # Current top channels are already covered.
         channel = live_channels.get(user) or dict(twitch_user=user, twitch_login=login, lang="RU", game_id=game_id)
-        rows = optional_archive_rows(user, archives, headers)
+        rows = optional_archive_rows(user, code, archives, headers)
         yield from channel_archives(channel, rows, current, known_live)
 
 
@@ -161,7 +161,7 @@ def previous_selection(entries, lang, game_id, current):
                 "directory_followup": True}
 
 
-def follow_archives(selected, previous, archives, headers, current):
+def follow_archives(selected, previous, code, archives, headers, current):
     seen = {(item["key"], item["kind"]) for item in selected}
     for item in previous:
         if item["kind"] == "vod" and (item["key"], "vod") not in seen:
@@ -172,7 +172,7 @@ def follow_archives(selected, previous, archives, headers, current):
         if item["kind"] != "live" or (key, "live") in seen or (key, "vod") in seen:
             continue
         user = item["twitch_user"]
-        rows = optional_archive_rows(user, archives, headers)
+        rows = optional_archive_rows(user, code, archives, headers)
         matched = next(channel_archives(item, rows, current, set(), exact=True), None)
         if matched:
             selected.append(matched)
@@ -204,20 +204,21 @@ def search(languages, current, *, known_live=(), previous=None):
         active = market_streams(lang, code, game_id, headers, current, channels=channels)
         if strict:
             selected.extend(active)
-            selected.extend(archive_candidates(channels, archives, headers, current, known_live, game_id, active=active))
+            selected.extend(archive_candidates(channels, code, archives, headers, current, known_live, game_id,
+                                               active=active))
         else:
             for stream in active:
                 selected.append(stream)
                 user = stream["twitch_user"]
-                archives[user] = archive_rows(user, headers)
+                archives[user] = archive_rows(user, code, headers)
                 selected.extend(channel_archives(stream, archives[user], current, known_live))
             if lang == "RU":
                 followed = optional_ru_channels(headers)
-                selected.extend(archive_candidates(followed, archives, headers, current, known_live, game_id))
+                selected.extend(archive_candidates(followed, code, archives, headers, current, known_live, game_id))
         retained = list(previous_selection(previous.get(lang, ()), lang, game_id, current))
         if strict:
             retained = [item for item in retained if item["twitch_user"] in channels]
-        follow_archives(selected, retained, archives, headers, current)
+        follow_archives(selected, retained, code, archives, headers, current)
         if strict:
             priority = {user: index for index, user in enumerate(channels, start=1)}
             for item in selected:

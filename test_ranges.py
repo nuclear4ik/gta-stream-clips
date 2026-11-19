@@ -8,14 +8,32 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
-from clips import read_ranges
+from clips import Highlight, Recording, read_ranges, transcribe
 
 
 EDITOR = Path(__file__).resolve().with_name("clips.py")
 
 
 class RangesTest(unittest.TestCase):
+    def test_whisper_receives_ffmpeg_samples_and_source_timestamps(self):
+        source = Path("source.mp4")
+        recording = Recording(30, 0, 2, 1920, 1080)
+        moment = Highlight(12, 15, 13.5, None, "manual")
+        audio = SimpleNamespace(size=48000)
+        segment = SimpleNamespace(start=.125, end=.875, text="Watch out!", words=())
+        info = SimpleNamespace(language="en", language_probability=.97)
+        model = Mock()
+        model.transcribe.return_value = (iter([segment]), info)
+        with patch("clips.audio_samples", return_value=audio) as decode:
+            captions, detected = transcribe(model, source, recording, moment, None)
+        decode.assert_called_once_with(source, recording, 12, 3)
+        model.transcribe.assert_called_once_with(audio, language=None, beam_size=3, vad_filter=True, word_timestamps=True)
+        self.assertEqual([(item.start, item.end, item.text) for item in captions], [(12.125, 12.875, "Watch out!")])
+        self.assertEqual(detected, {"code": "en", "confidence": .97})
+
     def test_rejects_invalid_ranges_before_editing(self):
         invalid = (
             {"start_seconds": True, "end_seconds": 4},

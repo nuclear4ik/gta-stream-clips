@@ -57,6 +57,7 @@ class TwitchDirectoryTests(unittest.TestCase):
                 user = int(options["user_id"])
                 video_queries.append(user)
                 language = next(code for code, base in offsets.items() if 1 <= user - base <= 10)
+                self.assertEqual(options["language"], language)
                 return [archive(user, language, current)]
             self.fail(f"Unexpected endpoint {endpoint}")
 
@@ -166,6 +167,7 @@ class TwitchDirectoryTests(unittest.TestCase):
                         live(4, "en", 350), live(4, "ru", 300) | {"game_id": "501"}, live(4, "ru", 25)]
             user = options["user_id"]
             videos_requested.append(user)
+            self.assertEqual(options["language"], "ru")
             return {"1": [archive(1, "ru", current)],
                     "4": [archive(4, "ru", current),
                           archive(4, "ru", current, id="802", stream_id="1802", title="Контент без темы"),

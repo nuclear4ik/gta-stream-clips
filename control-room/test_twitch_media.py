@@ -111,6 +111,23 @@ class TwitchMediaTests(unittest.TestCase):
             connection.request.assert_called_once_with("GET", "/test.mp4?signature=abc")
             connection.close.assert_called_once()
 
+    def test_expired_clip_url_does_not_starve_the_next_authorized_clip(self):
+        rows = [clip("first", view_count=80), clip("second", view_count=12)]
+        links = [{"clip_id": name, "landscape_download_url": f"https://{CDN}/{name}.mp4"}
+                 for name in ("first", "second")]
+        gone = FakeResponse(b"")
+        gone.status = 403
+        with TemporaryDirectory() as folder, patch.dict(os.environ, ENV, clear=True), patch(
+                "discovery.helix", side_effect=[rows, links]), patch("twitch_media.HTTPSConnection") as connect:
+            target = Path(folder) / "twitch-vod-10.mp4"
+            connection = connect.return_value
+            connection.getresponse.side_effect = [gone, FakeResponse(FILE, str(len(FILE)))]
+            self.assertEqual(twitch_media.fetch(VOD, target, current=CURRENT), target)
+            self.assertEqual(target.read_bytes(), FILE)
+            self.assertEqual([call.args for call in connection.request.call_args_list],
+                             [("GET", "/first.mp4"), ("GET", "/second.mp4")])
+            self.assertEqual(list(Path(folder).iterdir()), [target])
+
     def test_disallows_wrong_host_redirects_credentials_and_non_https(self):
         with patch("twitch_media.HTTPSConnection") as connect:
             addresses = [f"http://{CDN}/video", f"https://{CDN}@other.invalid/v",

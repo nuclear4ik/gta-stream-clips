@@ -1,4 +1,4 @@
-"""Network checks and private uploads via the official YouTube API."""
+"""Network checks and OAuth for the official platform APIs."""
 import base64
 import http.client
 import ipaddress
@@ -133,6 +133,12 @@ def json_response(status, data, action):
     return result
 
 
+def youtube_auth_response(status, data, action):
+    if status == 429 or 500 <= status < 600:
+        raise RouteProblem(f"{action}: сервис временно недоступен (HTTP {status}).")
+    return json_response(status, data, action)
+
+
 def token_request(region, **fields):
     if not youtube_configured():
         raise ConnectionProblem("На сервере не настроен OAuth YouTube.")
@@ -140,7 +146,7 @@ def token_request(region, **fields):
                       "client_secret": os.environ["STREAMCUT_GOOGLE_CLIENT_SECRET"]}).encode()
     status, _, data = request(region, OAUTH_HOST, "POST", "/token",
                               {"Content-Type": "application/x-www-form-urlencoded"}, body)
-    token = json_response(status, data, "Авторизация YouTube")
+    token = youtube_auth_response(status, data, "Авторизация YouTube")
     if not isinstance(token.get("access_token"), str):
         raise ConnectionProblem("YouTube не выдал токен доступа.")
     return token
@@ -150,7 +156,7 @@ def confirm_channel(region, token, expected):
     headers = {"Authorization": f"Bearer {token}"}
     status, _, data = request(region, API_HOSTS["YouTube"], "GET",
                               "/youtube/v3/channels?part=id&mine=true", headers)
-    channels = json_response(status, data, "Проверка канала").get("items", [])
+    channels = youtube_auth_response(status, data, "Проверка канала").get("items", [])
     if not isinstance(channels, list) or not any(isinstance(item, dict) and item.get("id") == expected
                                                 for item in channels):
         raise ConnectionProblem("Подключён другой канал YouTube. Выберите нужный канал при входе.")
@@ -181,30 +187,3 @@ def verify_youtube_write_route(region, token, expected_channel):
         confirm_channel(region, token, expected_channel)
     except NetworkProblem as error:
         raise RouteProblem(str(error)) from error
-
-
-def upload_private(region, token, title, lang, path, *, expected_channel=None):
-    verify_youtube_write_route(region, token, expected_channel)
-    size = path.stat().st_size
-    headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json",
-               "X-Upload-Content-Type": "video/mp4", "X-Upload-Content-Length": str(size)}
-    language = {"RU": "ru", "EN": "en", "ESP": "es"}
-    metadata = json.dumps({"snippet": {"title": title[:100], "categoryId": "20",
-                                        "defaultLanguage": language[lang]},
-                           "status": {"privacyStatus": "private"}}, ensure_ascii=False).encode()
-    status, reply, _ = request(region, API_HOSTS["YouTube"], "POST",
-                               "/upload/youtube/v3/videos?uploadType=resumable&part=snippet,status",
-                               headers, metadata)
-    location = urlsplit(next((v for k, v in reply.items() if k.lower() == "location"), ""))
-    if status not in (200, 201) or location.scheme != "https" or location.netloc != API_HOSTS["YouTube"] or not location.path.startswith("/upload/"):
-        raise ConnectionProblem(f"YouTube не открыл сессию загрузки (HTTP {status}).")
-    verify_youtube_write_route(region, token, expected_channel)
-    with path.open("rb") as video:
-        headers = {"Authorization": f"Bearer {token}", "Content-Type": "video/mp4",
-                   "Content-Length": str(size)}
-        target = location.path + ("?" + location.query if location.query else "")
-        status, _, data = request(region, API_HOSTS["YouTube"], "PUT", target, headers, video, timeout=120)
-    result = json_response(status, data, "Загрузка YouTube")
-    if not result.get("id"):
-        raise ConnectionProblem("YouTube не подтвердил идентификатор видео.")
-    return result["id"]

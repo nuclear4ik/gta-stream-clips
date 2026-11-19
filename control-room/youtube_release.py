@@ -18,7 +18,6 @@ LIMIT_REASONS = {
     "dailyLimitExceeded", "quotaExceeded", "rateLimitExceeded", "uploadLimitExceeded",
     "userRateLimitExceeded", "tooManyRequests",
 }
-MAX_UPLOADS_PAGES = 10
 MUTABLE_STATUS = ("license", "embeddable", "publicStatsViewable", "selfDeclaredMadeForKids", "containsSyntheticMedia")
 
 
@@ -129,6 +128,13 @@ def limit_error(status, body, headers):
                               retry_after_seconds=retry_delay(reason, headers))
 
 
+def retryable_read_or_init(status, body, headers):
+    limit_error(status, body, headers)
+    if status == 429 or 500 <= status < 600:
+        raise SlotUnavailable(f"YouTube временно недоступен (HTTP {status}).",
+                              retry_after_seconds=retry_delay(None, headers))
+
+
 def session_path(response_headers):
     try:
         location = next((value for key, value in response_headers.items() if key.lower() == "location"), "")
@@ -149,6 +155,25 @@ def verify_write_route(route, token, expected_channel):
         raise
     except transport.ConnectionProblem as error:
         raise UploadRejected(str(error)) from error
+
+
+def upload_result_id(status, body):
+    try:
+        identifier = transport.json_response(status, body, "Загрузка YouTube").get("id")
+    except transport.ConnectionProblem:
+        return None
+    return identifier if isinstance(identifier, str) and VIDEO_ID.fullmatch(identifier) else None
+
+
+def check_upload_result(route, auth, session, size):
+    # Query the existing resumable session without sending the media again.
+    headers = {**auth, "Content-Length": "0", "Content-Range": f"bytes */{size}"}
+    try:
+        transport.require_youtube_write_route(route)
+        status, _, body = transport.request(route, HOST, "PUT", session, headers)
+    except transport.ConnectionProblem:
+        return None
+    return upload_result_id(status, body)
 
 
 def upload(route, token, *, title, description, tags, lang, path, publish_at=None,
@@ -173,15 +198,10 @@ def upload(route, token, *, title, description, tags, lang, path, publish_at=Non
                 route, HOST, "POST", UPLOAD_PATH + "?uploadType=resumable&part=snippet,status&notifySubscribers=false",
                 headers, body)
         except transport.NetworkProblem as error:
-            if route == transport.GATEWAY:
-                raise transport.RouteProblem(str(error)) from error
-            raise UploadRejected(str(error)) from error
+            raise transport.RouteProblem(str(error)) from error
         except transport.ConnectionProblem as error:
             raise UploadRejected(str(error)) from error
-        limit_error(code, data, response_headers)
-        if code == 429:
-            raise SlotUnavailable("YouTube временно ограничил частоту запросов.",
-                                  retry_after_seconds=retry_delay(None, response_headers))
+        retryable_read_or_init(code, data, response_headers)
         session = session_path(response_headers) if code in (200, 201) else None
         if session is None:
             raise UploadRejected(f"YouTube не открыл сессию загрузки (HTTP {code}).")
@@ -191,16 +211,16 @@ def upload(route, token, *, title, description, tags, lang, path, publish_at=Non
         headers = {**auth, "Content-Type": "video/mp4", "Content-Length": str(size)}
         try:
             code, response_headers, body = transport.request(route, HOST, "PUT", session, headers, media, timeout=120)
-        except (OSError, transport.ConnectionProblem) as error:
-            raise PublishUncertain("YouTube не подтвердил отправку. Проверьте YouTube Studio.") from error
-    limit_error(code, body, response_headers)
-    try:
-        response = transport.json_response(code, body, "Загрузка YouTube")
-        identifier = response.get("id")
-        if not isinstance(identifier, str) or not VIDEO_ID.fullmatch(identifier):
-            raise ValueError("Missing video ID")
-    except (transport.ConnectionProblem, ValueError) as error:
-        raise PublishUncertain("YouTube не подтвердил ID видео. Проверьте YouTube Studio.") from error
+        except (OSError, transport.ConnectionProblem):
+            code = None
+    identifier = None
+    if code is not None:
+        limit_error(code, body, response_headers)
+        identifier = upload_result_id(code, body)
+    if identifier is None and (code is None or 200 <= code < 300 or code == 308 or code >= 500):
+        identifier = check_upload_result(route, auth, session, size)
+    if identifier is None:
+        raise PublishUncertain("YouTube не подтвердил ID видео. Проверьте YouTube Studio.")
     return identifier
 
 
@@ -208,10 +228,7 @@ def read(route, token, resource, **query):
     status, headers, body = transport.request(
         route, HOST, "GET", f"/youtube/v3/{resource}?" + urlencode(query),
         {"Authorization": f"Bearer {token}"})
-    limit_error(status, body, headers)
-    if status == 429:
-        raise SlotUnavailable("YouTube временно ограничил частоту запросов.",
-                              retry_after_seconds=retry_delay(None, headers))
+    retryable_read_or_init(status, body, headers)
     return transport.json_response(status, body, "Проверка расписания YouTube")
 
 
@@ -220,6 +237,15 @@ def items(payload):
     if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
         raise transport.ConnectionProblem("YouTube вернул некорректный список видео.")
     return rows
+
+
+def object_field(payload, name, *, required=False):
+    value = payload.get(name)
+    if value is None and not required:
+        return {}
+    if not isinstance(value, dict):
+        raise transport.ConnectionProblem("YouTube вернул неполные данные о видео или канале.")
+    return value
 
 
 def publication_status(route, token, video_ids):
@@ -231,12 +257,16 @@ def publication_status(route, token, video_ids):
         entry = read(route, token, "videos", part="status,contentDetails,processingDetails",
                      id=",".join(batch), fields="items(id,status,contentDetails/contentRating/ytRating,processingDetails)")
         for row in items(entry):
-            if row.get("id") not in batch or not isinstance(row.get("status"), dict):
+            if row.get("id") not in batch:
                 continue
-            rating = (row.get("contentDetails") or {}).get("contentRating") or {}
-            processing = row.get("processingDetails") or {}
+            status = object_field(row, "status", required=True)
+            if (status.get("privacyStatus") not in ("private", "public", "unlisted") or
+                    (status.get("publishAt") is not None and utc_datetime(status["publishAt"]) is None)):
+                raise transport.ConnectionProblem("YouTube вернул неполный статус публикации.")
+            rating = object_field(object_field(row, "contentDetails"), "contentRating")
+            processing = object_field(row, "processingDetails")
             result[row["id"]] = {
-                **row["status"],
+                **status,
                 **{key: processing[key] for key in ("processingStatus", "processingFailureReason") if key in processing},
                 "ytRating": rating.get("ytRating"),
             }
@@ -250,31 +280,31 @@ def scheduled_entries(route, token, channel_id, limit):
     me = read(route, token, "channels", part="contentDetails", mine="true",
               fields="items(id,contentDetails/relatedPlaylists/uploads)")
     playlist = next((
-        ((row.get("contentDetails") or {}).get("relatedPlaylists") or {}).get("uploads")
+        object_field(object_field(row, "contentDetails"), "relatedPlaylists").get("uploads")
         for row in items(me) if row.get("id") == channel_id
     ), None)
     if not isinstance(playlist, str) or not playlist:
         raise transport.ConnectionProblem("YouTube не подтвердил канал и его список загрузок.")
-    result, page = {}, {}
+    result, page, seen_pages = {}, {}, set()
     current = datetime.now(timezone.utc)
-    for _ in range(MAX_UPLOADS_PAGES):
+    while True:
         listing = read(route, token, "playlistItems", part="contentDetails", playlistId=playlist,
                        maxResults=50, fields="items/contentDetails/videoId,nextPageToken", **page)
-        ids = [(row.get("contentDetails") or {}).get("videoId") for row in items(listing)]
+        ids = [object_field(row, "contentDetails", required=True).get("videoId") for row in items(listing)]
+        if any(not isinstance(video, str) or not VIDEO_ID.fullmatch(video) for video in ids):
+            raise transport.ConnectionProblem("YouTube вернул неполный список загрузок.")
         for video, status in publication_status(route, token, ids).items():
             stamp = utc_datetime(status.get("publishAt"))
             if (status.get("privacyStatus") == "private" and stamp and stamp > current
                     and status.get("uploadStatus") not in ("failed", "rejected", "deleted")):
                 result[video] = stamp.isoformat(timespec="seconds")
         next_page = listing.get("nextPageToken")
-        if len(result) >= limit or not next_page:
+        if len(result) >= limit or next_page in (None, ""):
             return result
+        if not isinstance(next_page, str) or next_page in seen_pages:
+            raise transport.ConnectionProblem("YouTube вернул некорректную страницу списка загрузок.")
+        seen_pages.add(next_page)
         page = {"pageToken": next_page}
-    raise transport.ConnectionProblem("Не удалось проверить весь список загрузок канала YouTube.")
-
-
-def scheduled(route, token, channel_id, limit):
-    return sorted(scheduled_entries(route, token, channel_id, limit).values())
 
 
 def reschedule(route, token, video_id, publish_at, *, expected_channel=None):
@@ -284,12 +314,14 @@ def reschedule(route, token, video_id, publish_at, *, expected_channel=None):
     original = utc_datetime(status.get("publishAt"))
     if status.get("privacyStatus") != "private" or original is None or original <= datetime.now(timezone.utc):
         raise UploadRejected("Перенести можно неопубликованный ролик с будущей датой в YouTube.")
+    verify_write_route(route, token, expected_channel)
     planned = future_publication(publish_at)
+    if original <= datetime.now(timezone.utc):
+        raise UploadRejected("Прежнее время публикации уже наступило. Проверьте YouTube Studio.")
     fields = {key: status[key] for key in MUTABLE_STATUS if key in status}
     fields.update(privacyStatus="private", publishAt=planned.isoformat().replace("+00:00", "Z"))
     body = json.dumps({"id": video_id, "status": fields}).encode()
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-    verify_write_route(route, token, expected_channel)
     try:
         code, response_headers, data = transport.request(route, HOST, "PUT", "/youtube/v3/videos?part=status", headers, body)
     except transport.ConnectionProblem as error:

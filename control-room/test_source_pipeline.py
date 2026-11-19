@@ -339,7 +339,7 @@ class SourcePipelineTests(unittest.TestCase):
 
         with patch("moment_model.select_moments", return_value=[{
             "start_seconds": 1.25, "end_seconds": 3.0, "headline": "Everyone saw that coming",
-        }]) as select, patch("transport.upload_private") as upload:
+        }]) as select, patch("youtube_release.upload") as upload:
             service.edit_one()
             select.assert_called_once_with(TRANSCRIPT, "EN")
             upload.assert_not_called()

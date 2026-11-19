@@ -20,7 +20,6 @@ control-room/dist/*
 !control-room/dist/*.css
 !control-room/dist/assets/
 control-room/dist/assets/*
-!control-room/dist/assets/clip-preview.jpg
 !control-room/dist/assets/clip-preview.mp4
 !control-room/dist/assets/Montserrat-ExtraBold.ttf
 !control-room/dist/assets/FONT-LICENSE.txt

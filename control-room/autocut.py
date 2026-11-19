@@ -8,12 +8,11 @@ import math
 import os
 from pathlib import Path
 from statistics import median
-import subprocess
 
 import reaction
 import moment_model
 from captions import Caption, plain_text, srt_timestamp
-from clips import FFMPEG, probe
+from clips import audio_samples, decode_stream, probe
 from editing import Rectangle, get_crops, parse_crop
 
 
@@ -77,25 +76,6 @@ def whisper_model(name):
     return WhisperModel(name, device="cpu", compute_type="int8", cpu_threads=min(4, os.cpu_count() or 1))
 
 
-def decode(video, start, stream, options):
-    result = subprocess.run([
-        *FFMPEG, "-ss", f"{start:.3f}", "-i", str(video), "-map", f"0:{stream}", *options, "-"
-    ], capture_output=True, timeout=160)
-    if result.returncode:
-        detail = result.stderr.decode("utf-8", "replace").strip().splitlines()
-        raise ValueError(f"Автомонтаж: FFmpeg не прочитал запись. {detail[-1][:240] if detail else ''}")
-    return result.stdout
-
-
-def audio_samples(video, recording, start, duration):
-    import numpy as np
-
-    raw = decode(video, start, recording.audio_index, [
-        "-t", f"{duration:.3f}", "-ac", "1", "-ar", "16000", "-f", "f32le",
-    ])
-    return np.frombuffer(raw, dtype="<f4")
-
-
 def transcription(model, samples, lang, start, duration, *, vad):
     segments, _ = model.transcribe(
         samples, language=lang, beam_size=5, vad_filter=vad, word_timestamps=True,
@@ -137,7 +117,16 @@ def transcribe_recording(video, recording, model, lang):
                 if sum(cue.end - cue.start for cue in retry) > spoken:
                     window = retry
             # Context on both sides preserves utterances spanning a decode boundary.
-            captions.extend(cue for cue in window if begin <= (cue.start + cue.end) / 2 < begin + duration)
+            owned = [cue for cue in window if begin <= (cue.start + cue.end) / 2 < begin + duration]
+            if captions and owned:
+                previous, first = captions[-1], owned[0]
+                overlap = min(previous.end, first.end) - max(previous.start, first.start)
+                shorter = min(previous.end - previous.start, first.end - first.start)
+                if (overlap > shorter / 2 and previous.text.casefold().rstrip(".!?…")
+                        == first.text.casefold().rstrip(".!?…")):
+                    # Whisper can shift the same border cue so each read claims it.
+                    owned = owned[1:]
+            captions.extend(owned)
     if not captions:
         raise ValueError("Автомонтаж не нашёл речь с таймкодами в исходной дорожке.")
     return captions
@@ -296,7 +285,7 @@ def detected_layout(video, recording, interval):
     start, end = interval["start_seconds"], interval["end_seconds"]
     images = []
     for fraction in CAMERA_SAMPLE_POSITIONS:
-        raw = decode(video, start + (end - start) * fraction, recording.video_index, [
+        raw = decode_stream(video, start + (end - start) * fraction, recording.video_index, [
             "-frames:v", "1", "-vf", f"scale={width}:{height},format=rgb24", "-pix_fmt", "rgb24",
             "-c:v", "rawvideo", "-threads:v", "1", "-f", "rawvideo",
         ])
