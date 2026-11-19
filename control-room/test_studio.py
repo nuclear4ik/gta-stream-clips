@@ -10,6 +10,12 @@ from unittest.mock import patch
 import schedule
 import studio
 import transport
+import youtube_release
+
+
+FIRST_VIDEO = "AbC012_defG"
+SECOND_VIDEO = "XYz012_defG"
+OTHER_VIDEO = "DEf012_defG"
 
 
 class PublishingTests(unittest.TestCase):
@@ -18,6 +24,16 @@ class PublishingTests(unittest.TestCase):
         self.addCleanup(self.temp.cleanup)
         self.s = studio.Studio(Path(self.temp.name))
         self.addCleanup(self.s.close)
+        self.clock = datetime(2026, 11, 19, 5, tzinfo=timezone.utc)
+        self.start_mock(patch("studio.now", side_effect=lambda: self.clock))
+        self.start_mock(patch.object(studio.Studio, "uploads_enabled", return_value=True))
+        self.start_mock(patch.object(studio.Studio, "shorts_valid", return_value=True))
+        self.start_mock(patch("transport.request", side_effect=AssertionError("Unexpected network request")))
+        self.prepare = self.start_mock(patch("transport.prepare_upload", return_value="access"))
+        self.slots = self.start_mock(patch("youtube_release.scheduled_entries", return_value={}))
+        self.slots.side_effect = lambda *_: dict(self.slots.return_value)
+        self.status = self.start_mock(patch("youtube_release.publication_status", return_value={}))
+        self.upload = self.start_mock(patch("youtube_release.upload", return_value=FIRST_VIDEO))
         for lang, suffix in (("RU", "r"), ("EN", "e"), ("ESP", "s")):
             self.s.add_account(dict(lang=lang, platform="YouTube", name=lang, route="server", target="UC" + suffix * 22))
         (self.s.output / "clip.mp4").write_bytes(b"fixture")
@@ -25,43 +41,160 @@ class PublishingTests(unittest.TestCase):
             account = db.execute("SELECT id FROM accounts WHERE lang='RU'").fetchone()[0]
             db.execute("UPDATE accounts SET auto=1,refresh_token='fixture' WHERE id=?", (account,))
             db.execute("INSERT INTO clips(lang,title,relative_path,verified) VALUES ('RU','Тест','clip.mp4',1)")
-            with patch.object(studio.Studio, "uploads_enabled", return_value=True):
-                self.s.populate(db)
-                self.s.populate(db)
+            self.s.populate(db)
+            self.s.populate(db)
             db.execute("UPDATE queue SET at=?", (studio.iso(studio.now() - timedelta(hours=1)),))
+
+    def start_mock(self, patcher):
+        self.addCleanup(patcher.stop)
+        return patcher.start()
+
+    def set_time(self, identifier, instant):
+        with self.s.db() as db:
+            db.execute("UPDATE queue SET at=? WHERE id=?", (studio.iso(instant), identifier))
+
+    def add_pending(self, title, instant):
+        with self.s.db() as db:
+            clip = db.execute("""INSERT INTO clips(lang,title,relative_path,verified)
+                VALUES ('RU',?,'clip.mp4',1) RETURNING id""", (title,)).fetchone()[0]
+            self.s.populate(db)
+            return db.execute("UPDATE queue SET at=? WHERE clip_id=? RETURNING id",
+                              (studio.iso(instant), clip)).fetchone()[0]
+
+    def confirm_last_upload(self, _route, _token, ids):
+        planned = self.upload.call_args.kwargs["publish_at"]
+        return {video: {"privacyStatus": "private", "publishAt": studio.iso(planned),
+                        "uploadStatus": "processed"} for video in ids}
 
     def test_language_dedup_and_preflight_failure(self):
         self.assertEqual([(q["lang"], q["status"]) for q in self.s.snapshot()["queue"]], [("RU", "scheduled")])
-        with patch.object(studio.Studio, "uploads_enabled", return_value=True), \
-                patch("transport.prepare_upload", side_effect=transport.ConnectionProblem("wrong region")), \
-                patch("transport.upload_private") as upload:
-            self.s.publish_one()
-        upload.assert_not_called()
+        self.prepare.side_effect = transport.ConnectionProblem("wrong region")
+        self.s.publish_one()
+        self.upload.assert_not_called()
         self.assertEqual(self.s.snapshot()["queue"][0]["status"], "blocked")
         self.assertNotIn("refresh_token", self.s.snapshot()["accounts"][0])
 
-    def test_paused_then_confirmation_persists(self):
-        with patch.object(studio.Studio, "uploads_enabled", return_value=True), \
-                patch("transport.prepare_upload", return_value="access"), \
-                patch("transport.upload_private", return_value="video-a") as upload:
-            self.s.change_setting("paused", True)
-            self.s.publish_one()
-            upload.assert_not_called()
-            self.s.change_setting("paused", False)
-            self.s.publish_one()
-            self.s.publish_one()
-            upload.assert_called_once()
+    def test_future_upload_preloads_before_deadline_and_persists_public_confirmation(self):
+        identifier = self.s.snapshot()["queue"][0]["id"]
+        requested = self.clock + timedelta(hours=4)
+        self.set_time(identifier, requested)
+        self.status.side_effect = self.confirm_last_upload
+        self.s.change_setting("paused", True)
+        self.s.publish_one()
+        self.upload.assert_not_called()
+        self.s.change_setting("paused", False)
+        self.s.publish_one()
+        self.s.publish_one()
+        self.upload.assert_called_once()
+        self.assertEqual(self.upload.call_args.kwargs["publish_at"], requested)
+        self.assertIn("GTA VI", self.upload.call_args.kwargs["description"])
+        self.assertIn("#Shorts", self.upload.call_args.kwargs["tags"])
         job = self.s.snapshot()["queue"][0]
-        self.assertEqual((job["status"], job["external_id"]), ("uploaded", "video-a"))
+        self.assertEqual((job["status"], job["external_id"], job["at"]),
+                         ("preloaded", FIRST_VIDEO, studio.iso(requested)))
+        self.clock = requested + timedelta(seconds=1)
+        self.status.side_effect = None
+        self.status.return_value = {FIRST_VIDEO: {"privacyStatus": "public", "uploadStatus": "processed"}}
+        self.s.sync_youtube()
+        job = self.s.snapshot()["queue"][0]
+        self.assertEqual((job["status"], job["external_id"]), ("uploaded", FIRST_VIDEO))
+        self.upload.assert_called_once()
 
     def test_uncertain_outcome_is_not_retried(self):
-        with patch.object(studio.Studio, "uploads_enabled", return_value=True), \
-                patch("transport.prepare_upload", return_value="access"), \
-                patch("transport.upload_private", side_effect=transport.ConnectionProblem("timeout")) as upload:
-            self.s.publish_one()
-            self.s.publish_one()
-        upload.assert_called_once()
+        self.upload.side_effect = youtube_release.PublishUncertain("timeout")
+        self.s.publish_one()
+        self.s.publish_one()
+        self.upload.assert_called_once()
         self.assertEqual(self.s.snapshot()["queue"][0]["status"], "unknown")
+
+    def test_local_review_time_does_not_create_a_youtube_upload(self):
+        with self.s.db() as db:
+            db.execute("UPDATE queue SET status='review'")
+        self.s.publish_one()
+        self.prepare.assert_not_called()
+        self.upload.assert_not_called()
+        self.assertEqual(self.s.snapshot()["queue"][0]["status"], "review")
+
+    def test_full_remote_slots_wait_then_preload_oldest_in_order(self):
+        first = self.s.snapshot()["queue"][0]["id"]
+        first_at = self.clock + timedelta(hours=3)
+        second_at = self.clock + timedelta(hours=4)
+        self.set_time(first, first_at)
+        second = self.add_pending("Следующий", second_at)
+        self.slots.return_value = {OTHER_VIDEO: studio.iso(self.clock + timedelta(hours=1))}
+        self.status.side_effect = self.confirm_last_upload
+        self.upload.side_effect = [FIRST_VIDEO, SECOND_VIDEO]
+        with patch.object(studio.Studio, "schedule_limit", return_value=1):
+            self.s.publish_one()
+            self.upload.assert_not_called()
+            with self.s.db() as db:
+                self.assertTrue(all(row[0] for row in db.execute("SELECT retry_at FROM queue")))
+            self.slots.return_value = {}
+            third = self.add_pending("Добавлен во время ожидания", self.clock + timedelta(hours=5))
+            self.s.publish_one()
+            self.upload.assert_not_called()
+            self.clock += timedelta(minutes=6)
+            self.s.publish_one()
+            self.assertEqual((self.upload.call_args.kwargs["title"], self.upload.call_args.kwargs["publish_at"]),
+                             ("Тест", first_at))
+            self.s.publish_one()
+            self.upload.assert_called_once()
+            self.clock = first_at + timedelta(minutes=1)
+            self.s.publish_one()
+            self.assertEqual((self.upload.call_args.kwargs["title"], self.upload.call_args.kwargs["publish_at"]),
+                             ("Следующий", second_at))
+        queue = {q["id"]: q for q in self.s.snapshot()["queue"]}
+        self.assertEqual((queue[first]["external_id"], queue[second]["external_id"]), (FIRST_VIDEO, SECOND_VIDEO))
+        self.assertIsNone(queue[third]["external_id"])
+
+    def test_platform_limit_then_retry_preserves_queue(self):
+        self.upload.side_effect = youtube_release.SlotUnavailable("upload cap", retry_after_seconds=90)
+        self.s.publish_one()
+        with self.s.db() as db:
+            waiting = db.execute("SELECT status,retry_at,external_id FROM queue").fetchone()
+        self.assertEqual(tuple(waiting), ("scheduled", studio.iso(self.clock + timedelta(seconds=90)), None))
+        self.s.publish_one()
+        self.upload.assert_called_once()
+
+    def test_reschedule_changes_remote_publication_and_keeps_video_identity(self):
+        identifier = self.s.snapshot()["queue"][0]["id"]
+        previous = self.clock + timedelta(hours=2)
+        changed = self.clock + timedelta(hours=5)
+        self.s.upload_status(identifier, "preloaded", external=FIRST_VIDEO, at=studio.iso(previous))
+        date = changed.astimezone(schedule.ZONES["RU"]).strftime("%Y-%m-%dT%H:%M")
+        with patch("youtube_release.reschedule") as move:
+            self.s.queue_action(dict(id=identifier, action="save", at=date))
+            move.assert_called_once_with("server", "access", FIRST_VIDEO, changed)
+        job = self.s.snapshot()["queue"][0]
+        self.assertEqual((job["status"], job["external_id"], job["at"]),
+                         ("preloaded", FIRST_VIDEO, studio.iso(changed)))
+        self.upload.assert_not_called()
+
+    def test_uncertain_reschedule_is_verified_without_reupload(self):
+        row = self.s.snapshot()["queue"][0]
+        original = self.clock + timedelta(hours=2)
+        proposed = self.clock + timedelta(hours=4)
+        self.s.upload_status(row["id"], "preloaded", external=FIRST_VIDEO, at=studio.iso(original))
+        date = proposed.astimezone(schedule.ZONES["RU"]).strftime("%Y-%m-%dT%H:%M")
+        with patch("youtube_release.reschedule", side_effect=youtube_release.ScheduleUncertain("timeout")):
+            with self.assertRaises(youtube_release.ScheduleUncertain):
+                self.s.queue_action(dict(id=row["id"], action="save", at=date))
+        self.assertEqual(self.s.snapshot()["queue"][0]["status"], "remote_check")
+        self.status.return_value = {FIRST_VIDEO: {"privacyStatus": "private", "publishAt": studio.iso(original)}}
+        self.s.sync_youtube()
+        job = self.s.snapshot()["queue"][0]
+        self.assertEqual((job["status"], job["at"]), ("preloaded", studio.iso(original)))
+        self.upload.assert_not_called()
+
+    def test_remote_removal_releases_preloaded_slot_and_never_reuploads_it(self):
+        identifier = self.s.snapshot()["queue"][0]["id"]
+        future = self.clock + timedelta(hours=2)
+        self.s.upload_status(identifier, "preloaded", external=FIRST_VIDEO, at=studio.iso(future))
+        self.s.sync_youtube()
+        job = self.s.snapshot()["queue"][0]
+        self.assertEqual((job["status"], job["external_id"]), ("blocked", FIRST_VIDEO))
+        self.s.publish_one()
+        self.upload.assert_not_called()
 
     def test_changed_route_requires_review_of_pending_job(self):
         account = next(row for row in self.s.snapshot()["accounts"] if row["lang"] == "RU")
@@ -70,11 +203,9 @@ class PublishingTests(unittest.TestCase):
         self.assertEqual(self.s.snapshot()["queue"][0]["status"], "review")
 
     def test_route_failure_blocks_and_recovery_moves_overdue_job_forward(self):
-        with patch.object(studio.Studio, "uploads_enabled", return_value=True), \
-                patch("transport.prepare_upload", side_effect=transport.RouteProblem("route went down")), \
-                patch("transport.upload_private") as upload:
-            self.s.publish_one()
-        upload.assert_not_called()
+        self.prepare.side_effect = transport.RouteProblem("route went down")
+        self.s.publish_one()
+        self.upload.assert_not_called()
         job = self.s.snapshot()["queue"][0]
         self.assertEqual(job["status"], "route_wait")
         self.s.record_connection(dict(route="server", platform="YouTube", state="ok",

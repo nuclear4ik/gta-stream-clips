@@ -98,6 +98,42 @@ class SourcePipelineTests(unittest.TestCase):
         self.assertEqual([service.get_source(i)["status"] for i in identifiers], ["ready", "ready"])
         self.assertEqual({clip["source_id"] for clip in service.snapshot()["clips"]}, set(identifiers))
 
+    def test_ready_inventory_stops_at_ten_and_reopens_after_youtube_accepts(self):
+        service = self.service()
+        with service.db() as db:
+            db.executemany("INSERT INTO clips(lang,title,relative_path) VALUES ('RU',?,?)",
+                           [(str(i), f"clip-{i}.mp4") for i in range(10)])
+        media = service.input / "RU" / "next.mp4"
+        media.write_bytes(b"fixture")
+        identifier = service.add_source({"lang": "RU", "file": media.name}, return_id=True)
+        with patch("studio.subprocess.run") as editor:
+            service.edit_one()
+            editor.assert_not_called()
+        self.assertEqual(service.get_source(identifier)["status"], "queued")
+        self.assertEqual(service.snapshot()["queue_counts"]["RU"], 10)
+        service.add_account(dict(lang="RU", platform="YouTube", name="Pilot", route="server", target="UC" + "0" * 22))
+        with service.db() as db:
+            db.execute("UPDATE queue SET status='preloaded' WHERE clip_id=1")
+        self.assertEqual(service.snapshot()["queue_counts"]["RU"], 9)
+
+        def fake_editor(command, **_):
+            self.assertEqual(command[command.index("--count") + 1], "1")
+            folder = Path(command[command.index("--output") + 1])
+            folder.mkdir()
+            (folder / "clip.mp4").write_bytes(b"fixture")
+            (folder / "manifest.json").write_text(json.dumps({
+                "clips": [{"video": "clip.mp4", "title": "Готовый клип"}],
+            }))
+            return subprocess.CompletedProcess(command, 0)
+
+        with patch("autocut.enabled", return_value=False), patch("studio.subprocess.run", side_effect=fake_editor):
+            service.edit_one()
+        result = service.snapshot()
+        self.assertEqual(result["queue_counts"]["RU"], 10)
+        ready = next(row for row in result["clips"] if row["source_id"] == identifier)
+        self.assertIn("#Shorts", ready["hashtags"])
+        self.assertIn("Готовый клип", ready["description"])
+
     @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "Requires FFmpeg and ffprobe")
     def test_discovered_source_with_local_recording_reaches_playable_mp4(self):
         service = self.service()

@@ -103,6 +103,7 @@ def twitch_archive(video, stream, user, code, title, age=timedelta(hours=1)):
 class TwitchDiscoveryTest(unittest.TestCase):
     def setUp(self):
         self.env = {"TWITCH_CLIENT_ID": "fixture-client", "TWITCH_CLIENT_SECRET": "fixture-secret",
+                    "STREAMCUT_DISCOVERY_MODE": "regional",
                     "STREAMCUT_TWITCH_RU": " @Fixture_RU ", "STREAMCUT_TWITCH_EN": "22",
                     "STREAMCUT_TWITCH_ESP": "fixture_es"}
         self.users = [{"id": "11", "login": "fixture_ru"}, {"id": "22", "login": "fixture_en"},

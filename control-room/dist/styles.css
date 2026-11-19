@@ -58,16 +58,22 @@ h2 { margin: 0; font-size: 17px; }
 .market-label { display: flex; align-items: center; gap: 10px; font-size: 14px; font-weight: 650; }
 .market-label small { font-weight: 400; }
 .market strong { flex-shrink: 0; font-size: clamp(23px, 4vw, 31px); font-variant-numeric: tabular-nums; }
+.market strong span { color: var(--sub); font-size: .52em; }
 .roster-grid { padding: 14px 18px; border-top: 1px solid var(--line); }
 .roster-grid strong { font-size: 13px; }
 .roster-grid small { line-height: 1.45; }
+.roster-grid ol { margin: 8px 0 0; padding-inline-start: 21px; font-size: 12px; }
+.roster-grid li { margin-top: 4px; overflow-wrap: anywhere; }
 .bar, .job, .account, .account-head { display: flex; align-items: center; gap: 14px; padding: 14px 18px; }
 .bar, .account { justify-content: space-between; }
 .bar .muted { font-size: 12px; }
+.queue-notice, .queue-subhead, .queue-empty { margin: 0; padding: 12px 18px; border-top: 1px solid var(--line); }
+.queue-notice, .queue-empty { color: var(--sub); font-size: 13px; }
+.queue-subhead { background: #222826; font-size: 14px; }
 .filters, .job-actions, .button-row { display: flex; align-items: center; flex-wrap: wrap; gap: 7px; }
 .filters button { min-height: 32px; padding: 5px 11px; font-size: 13px; }
 .job { display: grid; grid-template-columns: minmax(130px, .55fr) minmax(160px, 1.65fr) auto; border-top: 1px solid var(--line); min-height: 69px; }
-.job.source { grid-template-columns: 1fr auto; }
+.job.source, .job.job-ready { grid-template-columns: 1fr auto; }
 .job-time { font-size: 13px; color: var(--sub); white-space: nowrap; }
 .job-title { display: flex; align-items: center; gap: 10px; min-width: 0; overflow-wrap: anywhere; }
 .job-title strong { font-size: 14px; }
@@ -81,9 +87,9 @@ h2 { margin: 0; font-size: 17px; }
 .language.EN { background: #313d4e; color: #bad5fa; }
 .language.ESP { background: #4c382d; color: #ffcda6; }
 .status { background: #2c3532; color: #ced6d3; }
-.status.scheduled, .status.uploaded, .status.ready, .status.ok { background: #35452c; color: var(--accent); }
+.status.preloaded, .status.uploaded, .status.ready, .status.ok { background: #35452c; color: var(--accent); }
 .status.blocked, .status.failed, .status.unknown { background: #482e2d; color: #ffd2ca; }
-.status.stale, .status.route_wait { background: #423729; color: #fbd8a2; }
+.status.stale, .status.route_wait, .status.scheduled { background: #423729; color: #fbd8a2; }
 .error-note, .form-error { color: #f0bd94; }
 .blank { border-top: 1px solid var(--line); padding: 40px 20px; text-align: center; }
 .blank p { margin: 8px 0; font-size: 13px; color: var(--sub); }
@@ -119,8 +125,7 @@ summary { cursor: pointer; color: var(--sub); font-size: 14px; }
 .route-row small { overflow-wrap: anywhere; line-height: 1.4; }
 .route-actions { display: flex; flex-wrap: wrap; gap: 6px; justify-content: flex-end; align-items: center; }
 .route-actions .quiet { font-size: 12px; min-height: 32px; }
-.compact-list { padding: 0 18px 12px; }
-.compact-list > div { display: flex; align-items: center; gap: 10px; margin-top: 8px; }
+.clip-description { margin: 12px 0 0; white-space: pre-wrap; overflow-wrap: anywhere; }
 dialog { width: min(520px, calc(100% - 24px)); max-height: calc(100% - 24px); padding: 21px; border: 1px solid var(--line); border-radius: 14px; color: var(--text); background: var(--panel); }
 dialog::backdrop { background: #060807b8; }
 .dialog-head { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 15px; }
@@ -152,7 +157,7 @@ video { max-height: min(65vh, 660px); max-width: 100%; }
 @media (max-width: 620px) {
   .wrap { width: calc(100% - 24px); }
   main { padding-top: 24px; }
-  .job, .job.source { grid-template-columns: minmax(0, 1fr); padding: 12px; gap: 8px; }
+  .job, .job.source, .job.job-ready { grid-template-columns: minmax(0, 1fr); padding: 12px; gap: 8px; }
   .job-actions { justify-content: flex-start; }
   .bar, .account, .account-head, .roster-grid, .route-head, .route-row { padding-inline: 12px; }
   .job-actions button, .job-actions .status { font-size: 11px; }

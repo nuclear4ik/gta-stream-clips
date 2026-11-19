@@ -1,6 +1,12 @@
-# Автопоиск авторов
+# Поиск каналов Twitch
 
-Каждые пять часов Streamcut проверяет недавние видео и текущие эфиры о GTA 6 в YouTube и Twitch. Пауза или перезапуск сервиса сохраняет предыдущие результаты, а случайный повторный запуск не тратит квоту на новый поиск. Если API временно недоступен, доступные свежие результаты этой площадки остаются в списке.
+По умолчанию Streamcut повторяет три отдельных фильтра каталога Grand Theft Auto VI и сортирует активные эфиры по текущему количеству зрителей. Для каждого языка берутся первые десять уникальных каналов. Затем сервис проверяет до пяти свежих публичных архивов на канал. Эфир и его архив связываются по `stream_id`. Поиск запускается раз в пять часов. [Twitch Get Streams](https://dev.twitch.tv/docs/api/reference/streams#get-streams) · [Twitch Get Videos](https://dev.twitch.tv/docs/api/reference/videos#get-videos)
+
+Для поиска задайте `TWITCH_CLIENT_ID` и `TWITCH_CLIENT_SECRET`. Чтобы автоматически обработать предоставленную запись, сохраните её в `inbox/RU` как `twitch-vod-<id>.mp4`, где ID берётся из ссылки Twitch на архив. Копируйте под временным расширением и переименовывайте после завершения. В MVP автомонтаж по умолчанию применяется к RU.
+
+Автополучение MP4 использует официальный Twitch Get Clips Download для уже существующих клипов выбранной записи. Для каждого разрешённого канала задайте `STREAMCUT_TWITCH_CLIP_TOKEN_<broadcaster_id>`. Токен автора должен иметь `channel:manage:clips`. Для токена редактора используйте `editor:manage:clips` и укажите `STREAMCUT_TWITCH_CLIP_EDITOR_ID_<broadcaster_id>`. При наличии только ключей поиска карточка ждёт предоставленный файл. [Twitch Get Clips Download](https://dev.twitch.tv/docs/api/reference/clips#get-clips-download)
+
+Старый поиск по авторам доступен при `STREAMCUT_DISCOVERY_MODE=regional`.
 
 ## Как меняется список
 

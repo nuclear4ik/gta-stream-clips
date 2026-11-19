@@ -1,0 +1,107 @@
+"""Test discovery against the visible language-filtered Twitch directory."""
+
+from datetime import datetime, timedelta, timezone
+import os
+import unittest
+from unittest.mock import patch
+
+import discovery
+import regional
+import twitch_directory
+
+
+LANGUAGES = {"RU": "ru", "EN": "en", "ESP": "es"}
+SECRETS = {"TWITCH_CLIENT_ID": "test", "TWITCH_CLIENT_SECRET": "test"}
+GAME = "610"
+
+
+def live(user, language, viewers):
+    return dict(id=str(user + 1000), user_id=str(user), user_login=f"player_{user}", user_name=f"Author {user}",
+                type="live", game_id=GAME, language=language, viewer_count=viewers, title="В эфире")
+
+
+def archive(user, language, current, **fields):
+    return dict(id=str(user + 3000), user_id=str(user), stream_id=str(user + 1000),
+                user_name=f"Author {user}", type="archive", viewable="public",
+                language=language, created_at=(current - timedelta(hours=1)).isoformat(),
+                view_count=20, title="Запись прямого эфира") | fields
+
+
+class TwitchDirectoryTests(unittest.TestCase):
+    def test_only_top_ten_broadcasters_per_language_are_queried_for_archives(self):
+        offsets = {"ru": 0, "en": 100, "es": 200}
+        current = datetime(2026, 11, 19, 8, tzinfo=timezone.utc)
+        video_queries = []
+
+        def feed(endpoint, params, _headers, _action):
+            options = dict(params)
+            if endpoint == "games":
+                self.assertEqual(options, {"name": "Grand Theft Auto VI"})
+                return [{"id": "501", "name": "Grand Theft Auto V"}, {"id": GAME, "name": "Grand Theft Auto VI"}]
+            if endpoint == "streams":
+                self.assertEqual(options["game_id"], GAME)
+                code = options["language"]
+                base = offsets[code]
+                entries = [live(base + i, code, 1000 - i) for i in range(12, 0, -1)]
+                return entries + [live(base + 1, code, 500),
+                                  live(900, code, 5000) | {"game_id": "501"},
+                                  live(901, "ja", 4000)]
+            if endpoint == "videos":
+                self.assertEqual(options["type"], "archive")
+                self.assertEqual(options["sort"], "time")
+                user = int(options["user_id"])
+                video_queries.append(user)
+                language = next(code for code, base in offsets.items() if 1 <= user - base <= 10)
+                return [archive(user, language, current)]
+            self.fail(f"Unexpected endpoint {endpoint}")
+
+        with patch.dict(os.environ, SECRETS, clear=True), patch("discovery.twitch_headers", return_value={}), patch(
+                "discovery.helix", side_effect=feed):
+            result = twitch_directory.search(LANGUAGES, current)
+        self.assertEqual(video_queries, [base + i for base in offsets.values() for i in range(1, 11)])
+        for lang, code in LANGUAGES.items():
+            entries = result[lang]
+            self.assertEqual([entry["kind"] for entry in entries], ["live", "vod"] * 10)
+            for rank in range(1, 11):
+                stream, recording = entries[(rank - 1) * 2:rank * 2]
+                self.assertEqual(stream["key"], recording["key"])
+                self.assertEqual(stream["viewer_count"], 1000 - rank)
+                self.assertEqual((stream["directory_rank"], recording["directory_rank"]), (rank, rank))
+                self.assertEqual(recording["archive_id"], str(offsets[code] + rank + 3000))
+            self.assertTrue(all(entry["kind"] == "vod" for entry in regional.current_candidates(entries, current)))
+
+    def test_archive_must_be_public_recent_matching_and_linked_to_gta(self):
+        current = datetime(2026, 11, 19, 9, tzinfo=timezone.utc)
+        entries = [
+            archive(1, "ru", current),
+            archive(1, "ru", current, id="20", stream_id="190", title="Исследуем ГТА 6"),
+            archive(1, "ru", current, id="21", stream_id="166", title="Архив вчерашнего эфира"),
+            archive(1, "ru", current, id="22", stream_id="199", title="GTA V"),
+            archive(1, "ru", current, id="23", viewable="private"),
+            archive(1, "en", current, id="24"),
+            archive(2, "ru", current, id="25", title="GTA VI"),
+            archive(1, "ru", current - timedelta(days=4), id="26"),
+            archive(1, "ru", current, id="27", type="highlight"),
+        ]
+        with patch.dict(os.environ, SECRETS, clear=True), patch(
+                "discovery.twitch_headers", return_value={}), patch("discovery.helix", side_effect=[
+                    [{"id": GAME, "name": "Grand Theft Auto VI"}], [live(1, "ru", 20)], entries,
+                ]):
+            found = twitch_directory.search({"RU": "ru"}, current, known_live={("RU", "166")})["RU"]
+        self.assertEqual([row["archive_id"] for row in found if row["kind"] == "vod"], ["3001", "20", "21"])
+
+    def test_missing_key_and_missing_exact_category(self):
+        current = datetime(2026, 11, 19, tzinfo=timezone.utc)
+        with patch.dict(os.environ, {}, clear=True), patch("discovery.helix") as helix:
+            self.assertIsNone(twitch_directory.search(LANGUAGES, current))
+            helix.assert_not_called()
+        with patch.dict(os.environ, SECRETS, clear=True), patch(
+                "discovery.twitch_headers", return_value={}), patch(
+                "discovery.helix", return_value=[{"id": "501", "name": "Grand Theft Auto V"}]) as helix:
+            with self.assertRaisesRegex(discovery.ConnectionProblem, "Grand Theft Auto VI"):
+                twitch_directory.search(LANGUAGES, current)
+            helix.assert_called_once()
+
+
+if __name__ == "__main__":
+    unittest.main()

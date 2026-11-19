@@ -79,7 +79,9 @@ class RegionalTests(unittest.TestCase):
 
     def test_ten_ranked_per_market_new_author_displaces_previous(self):
         current = studio.now()
-        with TemporaryDirectory() as directory, patch.dict(os.environ, {"STREAMCUT_YOUTUBE_KEY": "test"}, clear=True):
+        with TemporaryDirectory() as directory, patch.dict(os.environ, {
+            "STREAMCUT_YOUTUBE_KEY": "test", "STREAMCUT_DISCOVERY_MODE": "regional",
+        }, clear=True):
             service = studio.Studio(Path(directory))
             self.addCleanup(service.close)
             service.search_status = ""
@@ -142,7 +144,9 @@ class RegionalTests(unittest.TestCase):
             self.assertEqual((found["lang"], found["status"], found["rel_file"]), ("EN", "queued", file))
 
     def test_stale_automatic_links_do_not_discard_manual_sources(self):
-        with TemporaryDirectory() as directory, patch.dict(os.environ, {"STREAMCUT_YOUTUBE_KEY": "test"}, clear=True):
+        with TemporaryDirectory() as directory, patch.dict(os.environ, {
+            "STREAMCUT_YOUTUBE_KEY": "test", "STREAMCUT_DISCOVERY_MODE": "regional",
+        }, clear=True):
             s = studio.Studio(Path(directory))
             self.addCleanup(s.close)
             stale = studio.now() - timedelta(days=5)
