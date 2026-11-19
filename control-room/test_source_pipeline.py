@@ -43,6 +43,8 @@ class SourcePipelineTests(unittest.TestCase):
             self.assertEqual(studio.source_url(link), (URL, "youtube:abcdefghijk"))
         self.assertEqual(studio.source_url("https://twitch.tv/IlloJuan")[1], "twitch:live:illojuan")
         self.assertEqual(studio.source_url("https://twitch.tv/videos/12345")[1], "twitch:vod:12345")
+        for clip in ("https://twitch.tv/creator/clip/Clip-A", "https://clips.twitch.tv/Clip-A"):
+            self.assertEqual(studio.source_url(clip), ("https://clips.twitch.tv/Clip-A", "twitch:clip:Clip-A"))
         for link in ("http://youtu.be/abcdefghijk", "https://youtube.com.example.com/watch?v=abcdefghijk",
                      "https://user:password@youtube.com/watch?v=abcdefghijk", "https://twitch.tv/directory"):
             with self.assertRaises(ValueError):

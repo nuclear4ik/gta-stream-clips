@@ -8,7 +8,11 @@ from urllib.parse import unquote, urlencode, urlsplit
 
 API_HOSTS = {"YouTube": "www.googleapis.com", "TikTok": "open.tiktokapis.com",
              "Reels": "graph.instagram.com"}
-REGIONS = {"server", "RU", "US", "ES"}
+GATEWAY = "gateway"
+REGIONS = {"server", GATEWAY, "RU", "US", "ES"}
+OAUTH_HOST = "oauth2.googleapis.com"
+GATEWAY_HOSTS = frozenset((*API_HOSTS.values(), OAUTH_HOST))
+GATEWAY_REQUIRED_DETAIL = "Для загрузки YouTube выберите доверенный шлюз."
 REDIRECTS = {301, 302, 303, 307, 308}
 YOUTUBE_SCOPES = " ".join((
     "https://www.googleapis.com/auth/youtube.upload",
@@ -26,19 +30,46 @@ class RouteProblem(ConnectionProblem):
     """A failure before uploading any bytes, eligible for route recovery."""
 
 
+class NetworkProblem(ConnectionProblem):
+    """No usable HTTP response was received."""
+
+
+def proxy_setting(region):
+    if region == GATEWAY:
+        return os.environ.get("STREAMCUT_UPLOAD_GATEWAY")
+    return os.environ.get(f"STREAMCUT_PROXY_{region}")
+
+
 def route_available(region):
-    return region == "server" or bool(os.environ.get(f"STREAMCUT_PROXY_{region}"))
+    return region == "server" or region in REGIONS and bool(proxy_setting(region))
+
+
+def youtube_gateway_required():
+    return os.environ.get("STREAMCUT_YOUTUBE_REQUIRE_GATEWAY") == "1"
+
+
+def youtube_write_route_allowed(region):
+    return not youtube_gateway_required() or region == GATEWAY
+
+
+def require_youtube_write_route(region):
+    if not youtube_write_route_allowed(region):
+        raise RouteProblem(GATEWAY_REQUIRED_DETAIL)
+    if region == GATEWAY and not route_available(region):
+        raise RouteProblem("Доверенный шлюз не настроен на сервере.")
 
 
 def request(region, host, method, path, headers=None, body=None, timeout=15):
-    if region not in REGIONS or not route_available(region):
-        raise ConnectionProblem("Маршрут не настроен на сервере.")
-    proxy = os.environ.get(f"STREAMCUT_PROXY_{region}") if region != "server" else None
+    if region not in REGIONS or region == GATEWAY and host not in GATEWAY_HOSTS:
+        raise ConnectionProblem("Маршрут не поддерживает этот адрес.")
+    proxy = proxy_setting(region) if region != "server" else None
+    if region != "server" and not proxy:
+        raise NetworkProblem("Маршрут не настроен на сервере.")
     try:
-        if proxy:
+        if region != "server":
             url = urlsplit(proxy)
             if url.scheme != "http" or not url.hostname or url.path not in ("", "/") or url.query or url.fragment:
-                raise ConnectionProblem("Нужен HTTP CONNECT через доверенный туннель.")
+                raise NetworkProblem("Нужен HTTP CONNECT через доверенный туннель.")
             connection = http.client.HTTPSConnection(url.hostname, url.port or 8080, timeout=timeout)
             tunnel_headers = {}
             if url.username is not None:
@@ -57,12 +88,14 @@ def request(region, host, method, path, headers=None, body=None, timeout=15):
         finally:
             connection.close()
     except (OSError, http.client.HTTPException, ValueError) as error:
-        raise ConnectionProblem("Соединение не установлено. Проверьте маршрут и TLS.") from error
+        raise NetworkProblem("Соединение не установлено. Проверьте маршрут и TLS.") from error
 
 
 def check_route(region, platform):
     if platform not in API_HOSTS:
         raise ConnectionProblem("Неизвестная площадка.")
+    if region == GATEWAY:
+        return {"country": None, "api_status": check_platform(region, platform)}
     status, _, data = request(region, "www.cloudflare.com", "GET", "/cdn-cgi/trace")
     try:
         trace = dict(line.split("=", 1) for line in data.decode().splitlines() if "=" in line)
@@ -74,10 +107,14 @@ def check_route(region, platform):
         raise ConnectionProblem("Не удалось подтвердить страну выхода.") from error
     if region != "server" and country != region:
         raise ConnectionProblem(f"Страна выхода {country}, ожидается {region}.")
+    return {"country": country, "api_status": check_platform(region, platform)}
+
+
+def check_platform(region, platform):
     status, _, _ = request(region, API_HOSTS[platform], "GET", "/")
     if not 200 <= status < 500 or status in REDIRECTS or status in (407, 429, 451):
         raise ConnectionProblem(f"API площадки недоступен (HTTP {status}).")
-    return {"country": country, "api_status": status}
+    return status
 
 
 def youtube_configured():
@@ -101,7 +138,7 @@ def token_request(region, **fields):
         raise ConnectionProblem("На сервере не настроен OAuth YouTube.")
     body = urlencode({**fields, "client_id": os.environ["STREAMCUT_GOOGLE_CLIENT_ID"],
                       "client_secret": os.environ["STREAMCUT_GOOGLE_CLIENT_SECRET"]}).encode()
-    status, _, data = request(region, "oauth2.googleapis.com", "POST", "/token",
+    status, _, data = request(region, OAUTH_HOST, "POST", "/token",
                               {"Content-Type": "application/x-www-form-urlencoded"}, body)
     token = json_response(status, data, "Авторизация YouTube")
     if not isinstance(token.get("access_token"), str):
@@ -114,7 +151,8 @@ def confirm_channel(region, token, expected):
     status, _, data = request(region, API_HOSTS["YouTube"], "GET",
                               "/youtube/v3/channels?part=id&mine=true", headers)
     channels = json_response(status, data, "Проверка канала").get("items", [])
-    if not any(isinstance(item, dict) and item.get("id") == expected for item in channels):
+    if not isinstance(channels, list) or not any(isinstance(item, dict) and item.get("id") == expected
+                                                for item in channels):
         raise ConnectionProblem("Подключён другой канал YouTube. Выберите нужный канал при входе.")
 
 
@@ -123,13 +161,30 @@ def prepare_upload(account):
         check_route(account["route"], account["platform"])
     except ConnectionProblem as error:
         raise RouteProblem(str(error)) from error
-    token = token_request(account["route"], grant_type="refresh_token",
-                          refresh_token=account["refresh_token"])["access_token"]
-    confirm_channel(account["route"], token, account["target"])
+    try:
+        token = token_request(account["route"], grant_type="refresh_token",
+                              refresh_token=account["refresh_token"])["access_token"]
+        confirm_channel(account["route"], token, account["target"])
+    except NetworkProblem as error:
+        raise RouteProblem(str(error)) from error
     return token
 
 
-def upload_private(region, token, title, lang, path):
+def verify_youtube_write_route(region, token, expected_channel):
+    require_youtube_write_route(region)
+    if region != GATEWAY:
+        return
+    if not expected_channel:
+        raise ConnectionProblem("Проверьте ID канала YouTube перед загрузкой.")
+    try:
+        # A successful authenticated request proves both gateway reachability and account identity.
+        confirm_channel(region, token, expected_channel)
+    except NetworkProblem as error:
+        raise RouteProblem(str(error)) from error
+
+
+def upload_private(region, token, title, lang, path, *, expected_channel=None):
+    verify_youtube_write_route(region, token, expected_channel)
     size = path.stat().st_size
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json",
                "X-Upload-Content-Type": "video/mp4", "X-Upload-Content-Length": str(size)}
@@ -143,6 +198,7 @@ def upload_private(region, token, title, lang, path):
     location = urlsplit(next((v for k, v in reply.items() if k.lower() == "location"), ""))
     if status not in (200, 201) or location.scheme != "https" or location.netloc != API_HOSTS["YouTube"] or not location.path.startswith("/upload/"):
         raise ConnectionProblem(f"YouTube не открыл сессию загрузки (HTTP {status}).")
+    verify_youtube_write_route(region, token, expected_channel)
     with path.open("rb") as video:
         headers = {"Authorization": f"Bearer {token}", "Content-Type": "video/mp4",
                    "Content-Length": str(size)}

@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+import os
 import unittest
 from unittest.mock import patch
 
@@ -7,6 +8,29 @@ import transport
 
 
 class ConnectionsTest(unittest.TestCase):
+    def test_gateway_diagnostics_use_platform_tls_without_geolocation(self):
+        with patch.dict(os.environ, {"STREAMCUT_UPLOAD_GATEWAY": "http://trusted.example"}), patch(
+            "transport.request", return_value=(403, {}, b"")
+        ) as request:
+            result = connections.observe("gateway", "YouTube")
+        request.assert_called_once_with("gateway", "www.googleapis.com", "GET", "/")
+        self.assertEqual((result["state"], result["country"]), ("ok", None))
+
+    def test_gateway_transport_does_not_fall_back_or_allow_arbitrary_hosts(self):
+        with patch.dict(os.environ), patch("transport.http.client.HTTPSConnection") as connect:
+            os.environ.pop("STREAMCUT_UPLOAD_GATEWAY", None)
+            with self.assertRaises(transport.ConnectionProblem):
+                transport.request("gateway", "www.googleapis.com", "GET", "/")
+            os.environ["STREAMCUT_UPLOAD_GATEWAY"] = "http://trusted.example:8080"
+            with self.assertRaises(transport.ConnectionProblem):
+                transport.request("gateway", "example.net", "GET", "/")
+            connect.assert_not_called()
+            connect.return_value.request.side_effect = OSError
+            with self.assertRaises(transport.NetworkProblem):
+                transport.request("gateway", "www.googleapis.com", "GET", "/")
+            connect.assert_called_once_with("trusted.example", 8080, timeout=15)
+            connect.return_value.set_tunnel.assert_called_once_with("www.googleapis.com", 443, headers={})
+
     def test_unconfigured_route_makes_no_request(self):
         with patch("transport.route_available", return_value=False), patch("transport.check_route") as check:
             result = connections.observe("ES", "TikTok")

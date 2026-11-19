@@ -42,7 +42,9 @@ def observe(route: str, platform: str) -> dict:
                 detail = message
         else:
             reported = result.get("country")
-            if not isinstance(reported, str) or not COUNTRY.fullmatch(reported):
+            if route == transport.GATEWAY:
+                state, detail = "ok", "Доверенный шлюз проверен, API отвечает по HTTPS."
+            elif not isinstance(reported, str) or not COUNTRY.fullmatch(reported):
                 state, detail = "failed", "Не удалось подтвердить страну выхода."
             elif route != "server" and reported != route:
                 country = reported

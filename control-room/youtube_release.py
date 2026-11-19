@@ -142,8 +142,17 @@ def session_path(response_headers):
     return url.path + "?" + url.query
 
 
+def verify_write_route(route, token, expected_channel):
+    try:
+        transport.verify_youtube_write_route(route, token, expected_channel)
+    except transport.RouteProblem:
+        raise
+    except transport.ConnectionProblem as error:
+        raise UploadRejected(str(error)) from error
+
+
 def upload(route, token, *, title, description, tags, lang, path, publish_at=None,
-           license="youtube", made_for_kids=False):
+           license="youtube", made_for_kids=False, expected_channel=None):
     body = upload_metadata(title, description, tags, lang, publish_at, license, made_for_kids)
     try:
         media = path.open("rb")
@@ -156,12 +165,17 @@ def upload(route, token, *, title, description, tags, lang, path, publish_at=Non
         media.seek(0)
         if not size:
             raise UploadRejected("Файл MP4 пуст.")
+        verify_write_route(route, token, expected_channel)
         headers = {**auth, "Content-Type": "application/json",
                    "X-Upload-Content-Type": "video/mp4", "X-Upload-Content-Length": str(size)}
         try:
             code, response_headers, data = transport.request(
                 route, HOST, "POST", UPLOAD_PATH + "?uploadType=resumable&part=snippet,status&notifySubscribers=false",
                 headers, body)
+        except transport.NetworkProblem as error:
+            if route == transport.GATEWAY:
+                raise transport.RouteProblem(str(error)) from error
+            raise UploadRejected(str(error)) from error
         except transport.ConnectionProblem as error:
             raise UploadRejected(str(error)) from error
         limit_error(code, data, response_headers)
@@ -171,6 +185,7 @@ def upload(route, token, *, title, description, tags, lang, path, publish_at=Non
         session = session_path(response_headers) if code in (200, 201) else None
         if session is None:
             raise UploadRejected(f"YouTube не открыл сессию загрузки (HTTP {code}).")
+        verify_write_route(route, token, expected_channel)
         if publish_at is not None:
             future_publication(publish_at)
         headers = {**auth, "Content-Type": "video/mp4", "Content-Length": str(size)}
@@ -262,8 +277,9 @@ def scheduled(route, token, channel_id, limit):
     return sorted(scheduled_entries(route, token, channel_id, limit).values())
 
 
-def reschedule(route, token, video_id, publish_at):
+def reschedule(route, token, video_id, publish_at, *, expected_channel=None):
     future_publication(publish_at)
+    transport.require_youtube_write_route(route)
     status = publication_status(route, token, [video_id]).get(video_id, {})
     original = utc_datetime(status.get("publishAt"))
     if status.get("privacyStatus") != "private" or original is None or original <= datetime.now(timezone.utc):
@@ -273,6 +289,7 @@ def reschedule(route, token, video_id, publish_at):
     fields.update(privacyStatus="private", publishAt=planned.isoformat().replace("+00:00", "Z"))
     body = json.dumps({"id": video_id, "status": fields}).encode()
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+    verify_write_route(route, token, expected_channel)
     try:
         code, response_headers, data = transport.request(route, HOST, "PUT", "/youtube/v3/videos?part=status", headers, body)
     except transport.ConnectionProblem as error:

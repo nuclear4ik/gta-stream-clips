@@ -2,6 +2,7 @@
 
 from datetime import datetime, timedelta, timezone
 import json
+import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
 import unittest
@@ -33,11 +34,16 @@ class YouTubeReleaseTests(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         self.video_path = Path(tmp.name) / "short.mp4"
         self.video_path.write_bytes(b"fixture mp4")
+        env = patch.dict(os.environ)
+        env.start()
+        self.addCleanup(env.stop)
+        os.environ.pop("STREAMCUT_YOUTUBE_REQUIRE_GATEWAY", None)
+        os.environ.pop("STREAMCUT_UPLOAD_GATEWAY", None)
 
-    def upload(self, **settings):
+    def upload(self, route="server", **settings):
         arguments = {"title": "Встреча в Vice City", "description": "Тест #Shorts",
                      "tags": ["#GTA6", "GTA VI"], "lang": "RU", "path": self.video_path}
-        return youtube.upload("server", "fixture-token", **{**arguments, **settings})
+        return youtube.upload(route, "fixture-token", **{**arguments, **settings})
 
     def test_schedule_sends_private_license_and_audience_metadata(self):
         planned = later(6)
@@ -93,6 +99,38 @@ class YouTubeReleaseTests(unittest.TestCase):
             with self.assertRaises(youtube.PublishUncertain):
                 self.upload()
             self.assertEqual(request.call_count, 2)
+
+    def test_strict_gateway_rejects_direct_upload_and_reschedule(self):
+        os.environ["STREAMCUT_YOUTUBE_REQUIRE_GATEWAY"] = "1"
+        with patch("transport.request") as request:
+            for route in ("server", "RU"):
+                with self.assertRaises(transport.RouteProblem):
+                    self.upload(route, expected_channel=CHANNEL)
+                with self.assertRaises(transport.RouteProblem):
+                    youtube.reschedule(route, "fixture-token", VIDEO, later(2), expected_channel=CHANNEL)
+            request.assert_not_called()
+
+    def test_gateway_confirms_channel_again_before_sending_media(self):
+        os.environ["STREAMCUT_YOUTUBE_REQUIRE_GATEWAY"] = "1"
+        os.environ["STREAMCUT_UPLOAD_GATEWAY"] = "http://trusted.example"
+        correct = response(200, {"items": [{"id": CHANNEL}]})
+        wrong = response(200, {"items": [{"id": "wrong-channel"}]})
+        opened = (200, SESSION, b"")
+        with patch("transport.request", side_effect=[correct, opened, wrong]) as request:
+            with self.assertRaisesRegex(youtube.UploadRejected, "другой канал"):
+                self.upload("gateway", expected_channel=CHANNEL)
+            self.assertEqual([call.args[2] for call in request.call_args_list], ["GET", "POST", "GET"])
+        with patch("transport.request", side_effect=[correct, opened, transport.NetworkProblem("gateway offline")]) as request:
+            with self.assertRaises(transport.RouteProblem):
+                self.upload("gateway", expected_channel=CHANNEL)
+            self.assertEqual([call.args[2] for call in request.call_args_list], ["GET", "POST", "GET"])
+        with patch("transport.request", side_effect=[
+            correct, opened, correct, transport.NetworkProblem("response lost"),
+        ]) as request:
+            with self.assertRaises(youtube.PublishUncertain):
+                self.upload("gateway", expected_channel=CHANNEL)
+            self.assertEqual([call.args[2] for call in request.call_args_list], ["GET", "POST", "GET", "PUT"])
+            self.assertTrue(all(call.args[:2] == ("gateway", HOST) for call in request.call_args_list))
 
     def test_schedule_counts_only_pending_private_uploads_on_the_verified_channel(self):
         start = later(2).isoformat().replace("+00:00", "Z")

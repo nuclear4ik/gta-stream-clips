@@ -29,10 +29,11 @@ async function panel(api, state = {}) {
   });
   const toast = {classList: {add() {}}};
   const document = element({querySelector: selector => ({'#app': app, '#dialog': dialog, '#toast': toast})[selector]});
-  const location = {protocol: 'http:', hash: '#sources', search: ''};
+  const location = {protocol: 'http:', hash: '#sources', search: '', origin: 'http://127.0.0.1:8766'};
+  const window = element();
   const data = {live: true, settings: {scan: true}, clips: [], queue: [], sources: [], accounts: [], ...state};
   runInNewContext(script, {
-    document, location, window: element(), AbortSignal, URLSearchParams, TextEncoder, TextDecoder,
+    document, location, window, AbortSignal, URLSearchParams, TextEncoder, TextDecoder,
     clearTimeout() {}, setInterval() {}, setTimeout() {},
     FormData: class extends Map {
       constructor(form) { super(Object.entries(form.fields)); }
@@ -40,7 +41,11 @@ async function panel(api, state = {}) {
     fetch: (path, options) => path === '/api/state' ? Promise.resolve(response(data)) : api(path, options),
   });
   await new Promise(setImmediate);
-  return {app, dialog, document, toast};
+  const navigate = page => {
+    location.hash = '#' + page;
+    window.fire('hashchange');
+  };
+  return {app, dialog, document, toast, navigate};
 }
 
 function sourceForm(fields, id = '') {
@@ -148,4 +153,58 @@ test('discovered Twitch sources show their acquisition stage', async () => {
   }
   assert.match(app.innerHTML, /Помощь &lt;пользователю&gt;/);
   assert.doesNotMatch(app.innerHTML, /Нужен исходный файл/);
+});
+
+test('Sources shows only Russian media and rankings while Queue keeps other languages', async () => {
+  const languages = [
+    ['RU', 'Городской эфир', 'Первый русский клип', 'Быстрый стример'],
+    ['EN', 'Foreign Stream', 'Foreign Clip', 'Foreign Creator'],
+    ['ESP', 'Directo Español', 'Corte Español', 'Creador Español'],
+  ];
+  const {app, dialog, document, navigate} = await panel(() => assert.fail('local display only'), {
+    search_configured: true,
+    sources: languages.map(([lang, title], index) => ({id: index + 1, lang, title, status: 'ready'})),
+    clips: languages.map(([lang, , title], index) => ({source_id: index + 1, id: index + 10, lang, title})),
+    roster: Object.fromEntries(languages.map(([lang, , , name]) => [lang, [name]])),
+    ranking_updated: Object.fromEntries(languages.map(([lang]) => [lang, '2026-11-19T08:00:00+00:00'])),
+  });
+  assert.match(app.innerHTML, /Городской эфир/);
+  assert.match(app.innerHTML, /Первый русский клип/);
+  assert.match(app.innerHTML, /Быстрый стример/);
+  assert.doesNotMatch(app.innerHTML, /Foreign|Español/);
+
+  await document.fire('click', {target: {closest: () => ({dataset: {do: 'source', id: ''}})}});
+  assert.match(dialog.innerHTML, /<option value="RU" selected>Русский<\/option>/);
+  assert.doesNotMatch(dialog.innerHTML, /<option value="(?:EN|ESP)"/);
+
+  navigate('queue');
+  assert.match(app.innerHTML, /Foreign Clip/);
+  assert.match(app.innerHTML, /Corte Español/);
+});
+
+test('the upload gateway has a country-neutral check and explicit account selection', async () => {
+  const account = {id: 1, name: 'Test account', lang: 'RU', platform: 'YouTube', route: 'server', connected: true};
+  const {app, dialog, document, toast, navigate} = await panel(async (path, options) => {
+    assert.equal(path, '/api/check');
+    assert.deepEqual(JSON.parse(options.body), {route: 'gateway', platform: 'YouTube'});
+    return response({state: 'ok', country: null});
+  }, {
+    accounts: [account], oauth: true, uploads: true, youtube_gateway_required: true,
+    routes: {server: true, gateway: true},
+    connections: [{route: 'gateway', platform: 'YouTube', state: 'ok', country: null}],
+  });
+
+  navigate('queue');
+  assert.match(app.innerHTML, /Выберите доверенный шлюз в настройках канала YouTube RU/);
+  navigate('connections');
+  assert.match(app.innerHTML, /Доверенный шлюз<\/h2>\s*<small>Проверка доступа к API по HTTPS/);
+  assert.doesNotMatch(app.innerHTML, /Ожидаемая страна: gateway|Выход: null/);
+  await document.fire('click', {target: {closest: () => ({dataset: {do: 'check-route', id: 'gateway/YouTube'}})}});
+  assert.equal(toast.textContent, 'API отвечает по HTTPS');
+
+  navigate('accounts');
+  await document.fire('click', {target: {closest: () => ({dataset: {do: 'account', id: '1'}})}});
+  assert.match(dialog.innerHTML, /<option value="server" selected>Прямой маршрут<\/option>/);
+  assert.match(dialog.innerHTML, /<option value="gateway">Доверенный шлюз<\/option>/);
+  assert.match(dialog.innerHTML, /Для отправки в YouTube требуется доверенный шлюз/);
 });

@@ -8,6 +8,19 @@ ZONES = {lang: ZoneInfo(name) for lang, name in {
 }.items()}
 HOURS = range(9, 19)
 DAY_LIMIT = len(HOURS)
+RU_WORKDAY_HOURS = range(16, 23)
+RU_WEEKEND_HOURS = (11, 12, 13, 14, 16, 17, 18, 19, 20, 21)
+
+
+def release_hours(day, lang):
+    if lang != "RU":
+        return HOURS
+    return RU_WEEKEND_HOURS if day.weekday() >= 5 else RU_WORKDAY_HOURS
+
+
+def in_release_window(instant, lang):
+    wall = instant.astimezone(ZONES[lang])
+    return wall.hour in release_hours(wall.date(), lang) and not (wall.minute or wall.second or wall.microsecond)
 
 
 def local_time(value, lang):
@@ -38,7 +51,7 @@ def available_slot(after, lang, reserved):
     used = [instant.astimezone(zone) for instant in reserved]
     while True:
         if sum(instant.date() == day for instant in used) < DAY_LIMIT:
-            for hour in HOURS:
+            for hour in release_hours(day, lang):
                 candidate = datetime.combine(day, time(hour), zone).astimezone(UTC)
                 if (candidate > after and
                         all(abs((candidate - instant.astimezone(UTC)).total_seconds()) >= 3600 for instant in used)):

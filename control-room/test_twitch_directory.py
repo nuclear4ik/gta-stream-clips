@@ -93,6 +93,46 @@ class TwitchDirectoryTests(unittest.TestCase):
             found = twitch_directory.search({"RU": "ru"}, current, known_live={("RU", "166")})["RU"]
         self.assertEqual([row["archive_id"] for row in found if row["kind"] == "vod"], ["3001", "20", "21"])
 
+    def test_explicit_ru_channels_add_only_relevant_recent_public_archives_to_backlog(self):
+        current = datetime(2026, 11, 19, 9, tzinfo=timezone.utc)
+        requested = []
+
+        def feed(endpoint, params, _headers, _action):
+            requested.append((endpoint, params))
+            options = dict(params)
+            if endpoint == "games":
+                return [{"id": GAME, "name": "Grand Theft Auto VI"}]
+            if endpoint == "streams":
+                return [live(1, "ru", 20)] if options["language"] == "ru" else []
+            if endpoint == "users":
+                return [{"id": str(user), "login": f"creator_{user}"} for user in (1, 2, 3, 4)]
+            if options["user_id"] == "1":
+                return [archive(1, "ru", current)]
+            if options["user_id"] == "3":
+                raise discovery.ConnectionProblem("Нет ответа Twitch для одного канала.")
+            self.assertEqual(options["user_id"], "2")
+            return [archive(2, "ru", current, title="Проходим GTA 6"),
+                    archive(2, "ru", current, id="601", stream_id="1600"),
+                    archive(2, "ru", current, id="602", stream_id="1601", title="GTA V"),
+                    archive(2, "ru", current, id="603", title="GTA 6", viewable="private"),
+                    archive(2, "en", current, id="604", title="GTA 6"),
+                    archive(4, "ru", current, id="605", title="GTA 6"),
+                    archive(2, "ru", current - timedelta(days=4), id="606", title="GTA 6")]
+
+        env = SECRETS | {"STREAMCUT_TWITCH_RU": "@Creator_1 | Creator_2 | creator_2 | creator_3 | bad-login"}
+        with patch.dict(os.environ, env, clear=True), patch("discovery.twitch_headers", return_value={}), patch(
+                "discovery.helix", side_effect=feed):
+            found = twitch_directory.search(LANGUAGES, current, known_live={('RU', '1600')})
+        self.assertEqual([params for endpoint, params in requested if endpoint == "users"],
+                         [[("login", "creator_1"), ("login", "creator_2"), ("login", "creator_3")]])
+        self.assertEqual([dict(params)["user_id"] for endpoint, params in requested if endpoint == "videos"],
+                         ["1", "2", "3"])
+        self.assertEqual([row["archive_id"] for row in found["RU"] if row["kind"] == "vod"], ["3001", "3002", "601"])
+        self.assertEqual([row["twitch_user"] for row in found["RU"] if "directory_rank" in row], ["1", "1"])
+        self.assertTrue(all(row["directory_followup"] for row in found["RU"] if row["twitch_user"] == "2"))
+        self.assertEqual(found["EN"], [])
+        self.assertEqual(found["ESP"], [])
+
     def test_missing_key_and_missing_exact_category(self):
         current = datetime(2026, 11, 19, tzinfo=timezone.utc)
         with patch.dict(os.environ, {}, clear=True), patch("discovery.helix") as helix:

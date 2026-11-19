@@ -30,6 +30,8 @@ class PublishingTests(unittest.TestCase):
         self.start_mock(patch("studio.now", side_effect=lambda: self.clock))
         self.start_mock(patch.dict(os.environ))
         os.environ.pop(AUTO_SOURCES, None)
+        os.environ.pop("STREAMCUT_YOUTUBE_REQUIRE_GATEWAY", None)
+        os.environ.pop("STREAMCUT_UPLOAD_GATEWAY", None)
         self.start_mock(patch.object(studio.Studio, "uploads_enabled", return_value=True))
         self.start_mock(patch.object(studio.Studio, "shorts_valid", return_value=True))
         self.start_mock(patch("transport.request", side_effect=AssertionError("Unexpected network request")))
@@ -85,7 +87,7 @@ class PublishingTests(unittest.TestCase):
 
     def test_future_upload_preloads_before_deadline_and_persists_public_confirmation(self):
         identifier = self.s.snapshot()["queue"][0]["id"]
-        requested = self.clock + timedelta(hours=4)
+        requested = self.clock + timedelta(hours=8)
         self.set_time(identifier, requested)
         self.status.side_effect = self.confirm_last_upload
         self.s.change_setting("paused", True)
@@ -187,8 +189,8 @@ class PublishingTests(unittest.TestCase):
 
     def test_full_remote_slots_wait_then_preload_oldest_in_order(self):
         first = self.s.snapshot()["queue"][0]["id"]
-        first_at = self.clock + timedelta(hours=3)
-        second_at = self.clock + timedelta(hours=4)
+        first_at = self.clock + timedelta(hours=8)
+        second_at = self.clock + timedelta(hours=9)
         self.set_time(first, first_at)
         second = self.add_pending("Следующий", second_at)
         self.slots.return_value = {OTHER_VIDEO: studio.iso(self.clock + timedelta(hours=1))}
@@ -200,7 +202,7 @@ class PublishingTests(unittest.TestCase):
             with self.s.db() as db:
                 self.assertTrue(all(row[0] for row in db.execute("SELECT retry_at FROM queue")))
             self.slots.return_value = {}
-            third = self.add_pending("Добавлен во время ожидания", self.clock + timedelta(hours=5))
+            third = self.add_pending("Добавлен во время ожидания", self.clock + timedelta(hours=10))
             self.s.publish_one()
             self.upload.assert_not_called()
             self.clock += timedelta(minutes=6)
@@ -216,6 +218,15 @@ class PublishingTests(unittest.TestCase):
         queue = {q["id"]: q for q in self.s.snapshot()["queue"]}
         self.assertEqual((queue[first]["external_id"], queue[second]["external_id"]), (FIRST_VIDEO, SECOND_VIDEO))
         self.assertIsNone(queue[third]["external_id"])
+
+    def test_ru_automatic_release_uses_local_weekday_and_weekend_windows(self):
+        monday = datetime(2026, 11, 23, 6, tzinfo=timezone.utc)
+        saturday = datetime(2026, 11, 21, 6, tzinfo=timezone.utc)
+        for now, expected in ((monday, 13), (saturday, 8)):
+            requested = now + timedelta(hours=1)
+            job = {"at": studio.iso(requested), "lang": "RU", "auto_scheduled": 1}
+            self.assertEqual(self.s.planned_time(job, [], now), now.replace(hour=expected))
+            self.assertEqual(self.s.planned_time(job | {"auto_scheduled": 0}, [], now), requested)
 
     def test_platform_limit_then_retry_preserves_queue(self):
         self.upload.side_effect = youtube_release.SlotUnavailable("upload cap", retry_after_seconds=90)
@@ -234,7 +245,8 @@ class PublishingTests(unittest.TestCase):
         date = changed.astimezone(schedule.ZONES["RU"]).strftime("%Y-%m-%dT%H:%M")
         with patch("youtube_release.reschedule") as move:
             self.s.queue_action(dict(id=identifier, action="save", at=date))
-            move.assert_called_once_with("server", "access", FIRST_VIDEO, changed)
+            move.assert_called_once_with("server", "access", FIRST_VIDEO, changed,
+                                         expected_channel="UC" + "r" * 22)
         job = self.s.snapshot()["queue"][0]
         self.assertEqual((job["status"], job["external_id"], job["at"]),
                          ("preloaded", FIRST_VIDEO, studio.iso(changed)))
@@ -271,6 +283,41 @@ class PublishingTests(unittest.TestCase):
         self.s.add_account(dict(id=account["id"], lang="RU", platform="YouTube", name="RU",
                                 route="ES", target="UC" + "r" * 22))
         self.assertEqual(self.s.snapshot()["queue"][0]["status"], "review")
+
+    def test_strict_gateway_holds_direct_without_using_its_healthy_route(self):
+        os.environ["STREAMCUT_YOUTUBE_REQUIRE_GATEWAY"] = "1"
+        self.s.publish_one()
+        self.s.record_connection(dict(route="server", platform="YouTube", state="ok",
+                                     country="RU", detail="", checked_at=studio.iso(self.clock)))
+        self.s.publish_one()
+        self.prepare.assert_not_called()
+        self.upload.assert_not_called()
+        snapshot = self.s.snapshot()
+        self.assertTrue(snapshot["youtube_gateway_required"])
+        self.assertEqual(snapshot["queue"][0]["status"], "route_wait")
+        self.assertEqual(snapshot["queue"][0]["detail"], transport.GATEWAY_REQUIRED_DETAIL)
+
+    def test_gateway_waits_without_config_and_recovers_after_safe_pre_media_failure(self):
+        os.environ["STREAMCUT_YOUTUBE_REQUIRE_GATEWAY"] = "1"
+        with self.s.db() as db:
+            db.execute("UPDATE accounts SET route='gateway' WHERE lang='RU'")
+        self.s.publish_one()
+        self.prepare.assert_not_called()
+        self.upload.assert_not_called()
+        self.assertEqual(self.s.snapshot()["queue"][0]["status"], "route_wait")
+        os.environ["STREAMCUT_UPLOAD_GATEWAY"] = "http://trusted.example:8080"
+        self.upload.side_effect = transport.RouteProblem("gateway failed before media")
+        healthy = dict(route="gateway", platform="YouTube", state="ok",
+                       country=None, detail="", checked_at=studio.iso(self.clock))
+        self.s.record_connection(healthy)
+        self.s.publish_one()
+        self.assertEqual(self.s.snapshot()["queue"][0]["status"], "route_wait")
+        self.upload.assert_called_once()
+        self.upload.side_effect = None
+        self.s.record_connection(healthy)
+        self.s.publish_one()
+        self.assertEqual(self.upload.call_count, 2)
+        self.assertTrue(all(call.args[0] == "gateway" for call in self.upload.call_args_list))
 
     def test_route_failure_blocks_and_recovery_moves_overdue_job_forward(self):
         self.prepare.side_effect = transport.RouteProblem("route went down")

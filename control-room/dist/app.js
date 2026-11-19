@@ -4,6 +4,8 @@
   const languages = {RU: 'Русский', EN: 'English', ESP: 'Español'};
   const platforms = ['YouTube', 'TikTok', 'Reels'];
   const countries = {RU: 'Россия', US: 'США', ES: 'Испания', server: 'Прямой маршрут'};
+  const routes = {...countries, gateway: 'Доверенный шлюз'};
+  const sourcesLanguage = 'RU';
   const markets = {
     RU: {country: 'RU', city: 'Москва', zone: 'Europe/Moscow'},
     EN: {country: 'US', city: 'Нью-Йорк', zone: 'America/New_York'},
@@ -177,11 +179,18 @@
   function publishingNotice() {
     if (!data.live) return '';
     if (!data.oauth) return '<div class="queue-notice">Для планирования нужны настройки Google OAuth на сервере. <a href="#accounts">Аккаунты →</a></div>';
-    if (!data.accounts.some(account => account.platform === 'YouTube' && account.lang === 'RU' && account.connected)) {
+    const connected = data.accounts.filter(account => account.platform === 'YouTube' && account.lang === 'RU' && account.connected);
+    if (!connected.length) {
       return '<div class="queue-notice">Подключите Google к каналу RU. Готовые ролики появятся в очереди сразу после монтажа. <a href="#accounts">Аккаунты →</a></div>';
     }
     if (!data.uploads) return '<div class="queue-notice">Отправка в YouTube выключена в настройках сервера.</div>';
     if (data.settings.paused) return '<div class="queue-notice">Новые отправки на паузе. YouTube опубликует уже запланированные ролики по их расписанию.</div>';
+    if (data.youtube_gateway_required && !data.routes?.gateway) {
+      return '<div class="queue-notice">Для отправки в YouTube настройте доверенный шлюз. <a href="#connections">Подключения →</a></div>';
+    }
+    if (data.youtube_gateway_required && !connected.some(account => account.route === 'gateway')) {
+      return '<div class="queue-notice">Выберите доверенный шлюз в настройках канала YouTube RU. <a href="#accounts">Аккаунты →</a></div>';
+    }
     return '';
   }
 
@@ -242,9 +251,12 @@
   }
 
   function sourcesPage() {
-    const roster = data.roster || {};
+    const roster = data.roster?.[sourcesLanguage] || [];
+    const sources = data.sources.filter(source => source.lang === sourcesLanguage);
+    const ranked = data.ranking_updated?.[sourcesLanguage];
     const clipsBySource = new Map();
     for (const clip of data.clips || []) {
+      if (clip.lang !== sourcesLanguage) continue;
       if (!clipsBySource.has(clip.source_id)) clipsBySource.set(clip.source_id, []);
       clipsBySource.get(clip.source_id).push(clip);
     }
@@ -252,17 +264,15 @@
       <section class="surface">
         <div class="bar"><div><strong>Автопоиск</strong>
           <small>${escape(data.search_status || (!data.live || data.search_configured
-            ? 'До 10 каналов на язык · по числу зрителей'
+            ? 'До 10 русскоязычных каналов · по числу зрителей'
             : 'Для поиска по категории нужны параметры API Twitch.'))}</small></div>
           ${data.live ? '<button class="quiet" data-do="scan" aria-pressed="' + data.settings.scan + '">' + (data.settings.scan ? 'Включён' : 'Выключен') + '</button>' : '<span class="status scheduled">Включён по умолчанию</span>'}</div>
-        <div class="roster-grid">${Object.entries(markets).map(([lang, market]) =>
-          `<div><strong>${badge(lang)} ${countries[market.country]}</strong>
-            <small>${data.ranking_updated?.[lang] ? 'Активные каналы · по зрителям' : 'Ожидает проверки категории'}</small>
-            ${data.ranking_updated?.[lang] && roster[lang]?.length
-              ? '<ol>' + roster[lang].map(name => '<li>' + escape(name) + '</li>').join('') + '</ol>' : ''}</div>`).join('')}</div>
-        ${data.sources.length ? '<div class="job-list">' + data.sources.map(source =>
+        <div class="source-roster"><strong>${badge(sourcesLanguage)} ${countries[markets[sourcesLanguage].country]}</strong>
+          <small>${ranked ? 'Активные каналы · по зрителям' : 'Ожидает проверки категории'}</small>
+          ${ranked && roster.length ? '<ol>' + roster.map(name => '<li>' + escape(name) + '</li>').join('') + '</ol>' : ''}</div>
+        ${sources.length ? '<div class="job-list">' + sources.map(source =>
           sourceCard(source, clipsBySource.get(source.id) || [])).join('') + '</div>' :
-            '<div class="blank"><strong>Нет источников</strong><p>Добавьте ссылку или положите разрешённый файл в папку нужного языка.</p></div>'}
+            '<div class="blank"><strong>Нет источников</strong><p>Добавьте ссылку или положите разрешённый файл в папку RU.</p></div>'}
       </section>`;
   }
 
@@ -273,7 +283,7 @@
       ? stats.day.split('-').reverse().join('.') : '';
     return `<article class="account">
       <div class="account-label"><strong>${escape(account.name)}</strong>
-        <small>${state} · ${escape(countries[account.route] || account.route)}</small>
+        <small>${state} · ${escape(routes[account.route] || account.route)}</small>
         ${account.target ? '<small>' + escape(account.target) + '</small>' : ''}</div>
       <dl class="metrics">
         <div><dt>Просмотры за сутки</dt><dd>${metric(stats.views)}</dd></div>
@@ -311,7 +321,9 @@
 
   function connectionsPage() {
     return `<div class="heading"><div><h1>Подключения</h1><p>${data.live ? 'Доступность API и страна выхода' : 'Проверки выполняются на рабочем сервере'}</p></div></div>
-      <div class="route-grid">${Object.entries(countries).map(([route, title]) => {
+      <div class="route-grid">${Object.entries(routes).map(([route, title]) => {
+        const description = {server: 'Страна определяется при проверке', gateway: 'Проверка доступа к API по HTTPS'}[route]
+          || 'Ожидаемая страна: ' + route;
         const rows = platforms.map(platform => {
           const item = data.connections?.find(entry => entry.route === route && entry.platform === platform);
           const fallback = !data.live ? 'preview' : data.routes?.[route] ? 'unchecked' : 'unconfigured';
@@ -319,7 +331,7 @@
           return {route, platform, ...item, state};
         });
         return `<section class="surface route-card"><div class="route-head"><h2>${title}</h2>
-          <small>${route === 'server' ? 'Страна определяется при проверке' : 'Ожидаемая страна: ' + route}</small></div>
+          <small>${description}</small></div>
           ${rows.map(item => {
             const checked = item.checked_at && Number.isFinite(Date.parse(item.checked_at))
               ? checkFormatter.format(new Date(item.checked_at)) + ' МСК' : '';
@@ -368,6 +380,8 @@
       profile = result.edit;
     }
     const mode = profile?.mode || 'auto';
+    const preferredLanguage = source?.lang || sourcesLanguage;
+    const languageOptions = page === 'sources' ? [preferredLanguage] : Object.keys(languages);
     const moments = (profile?.moments || []).map(({start_seconds, end_seconds, headline}) =>
       [start_seconds, end_seconds, headline].filter(value => value != null && value !== '').join(' — ')).join('\n');
     open(source ? 'Настроить монтаж' : 'Добавить источник', `<form id="source-form" data-id="${source?.id || ''}">
@@ -375,7 +389,7 @@
         `<input name="${field}" type="hidden" value="${escape(profile[field])}">`).join('')}
       ${!data.live ? '<p class="muted">В предпросмотре доступен только интерфейс. Обработку запускает локальный сервис.</p>' : ''}
       <div class="form-columns">
-        <label>Язык<select name="lang" ${source ? 'disabled' : ''}>${Object.entries(languages).map(([lang, text]) => option(lang, text, source?.lang)).join('')}</select></label>
+        <label>Язык<select name="lang" ${source ? 'disabled' : ''}>${languageOptions.map(lang => option(lang, languages[lang], preferredLanguage)).join('')}</select></label>
         <label>Название источника<input name="title" maxlength="140" value="${escape(source?.title)}"></label>
       </div>
       ${!source || source.url ? `<label>Ссылка YouTube или Twitch<input name="url" type="url" maxlength="2048" placeholder="https://…" value="${escape(source?.url)}" ${source ? 'readonly' : ''}></label>` : ''}
@@ -478,7 +492,7 @@
   }
 
   function routeOptions(selected) {
-    return Object.entries(countries).map(([id, name]) => option(
+    return Object.entries(routes).map(([id, name]) => option(
       id, name + (data.routes && !data.routes[id] ? ' · не настроен' : ''), selected,
     )).join('');
   }
@@ -503,6 +517,7 @@
       <label>Название<input name="name" required maxlength="100" value="${escape(account?.name || defaults[lang])}"></label>
       <label><span data-label="target">${targetLabel(platform)}</span><input name="target" required maxlength="100" placeholder="${platform === 'YouTube' ? 'UC…' : '@имя'}" value="${escape(account?.target)}"></label>
       <label>Маршрут отправки<select name="route">${routeOptions(account?.route || 'server')}</select></label>
+      ${data.youtube_gateway_required ? `<small data-gateway-hint ${platform === 'YouTube' ? '' : 'hidden'}>Для отправки в YouTube требуется доверенный шлюз.</small>` : ''}
       <div class="button-row"><button type="button" data-do="check" ${data.live ? '' : 'disabled'}>Проверить соединение</button>
         <button class="primary" ${data.live ? '' : 'disabled'}>Сохранить</button></div>
       <p class="form-error" role="status"></p>
@@ -530,7 +545,12 @@
     const job = data.queue.find(row => row.id === id);
     if (!job) return;
     const onYouTube = job.status === 'preloaded';
-    const ready = job.platform === 'YouTube' && data.uploads && data.oauth && jobAccount(job)?.connected;
+    const account = jobAccount(job);
+    const youtubeReady = job.platform === 'YouTube' && data.uploads && data.oauth && account?.connected;
+    const gatewayReady = !data.youtube_gateway_required || (data.routes?.gateway && account?.route === 'gateway');
+    const ready = youtubeReady && gatewayReady;
+    const unavailable = !youtubeReady ? 'Для переноса или планирования на YouTube нужно подключить Google и включить отправку.'
+      : 'Для переноса или планирования на YouTube нужен доверенный шлюз.';
     const instant = new Date(jobTime(job));
     const current = instant > new Date() ? instant : new Date(Date.now() + 3600000);
     open(job.title, `<form id="job-form" data-id="${id}">
@@ -538,7 +558,7 @@
       <div class="button-row"><button type="button" data-do="preview" data-id="${job.clip_id}">Смотреть</button>
         <a class="button" href="/media/${job.clip_id}" download="streamcut-${job.clip_id}.mp4">Скачать</a></div>
       <label>Дата и время · ${markets[job.lang].city}<input name="at" type="datetime-local" required value="${localFormatters[job.lang].format(current).replace(' ', 'T')}"></label>
-      ${!ready ? '<small>Для переноса или планирования на YouTube нужно подключить Google и включить отправку.</small>' : ''}
+      ${!ready ? '<small>' + unavailable + '</small>' : ''}
       <p class="form-error" role="status"></p>
       <div class="button-row">
         ${onYouTube ? '<button class="primary" name="action" value="save"' + (ready ? '' : ' disabled') + '>Перенести в YouTube</button>' :
@@ -582,7 +602,7 @@
       const [route, platform] = form ? [form.elements.route.value, form.elements.platform.value] : value.split('/');
       const result = await post('check', {route, platform});
       const message = result.state && result.state !== 'ok' ? result.detail || healthLabels[result.state]
-        : 'Выход: ' + result.country + ' · API отвечает';
+        : result.country ? 'Выход: ' + result.country + ' · API отвечает' : 'API отвечает по HTTPS';
       if (form) form.querySelector('.form-error').textContent = message;
       else notify(message);
     } else if (action === 'oauth') {
@@ -636,6 +656,8 @@
       } else if (event.target.name === 'platform') {
         form.querySelector('[data-label="target"]').textContent = targetLabel(event.target.value);
         form.elements.target.placeholder = event.target.value === 'YouTube' ? 'UC…' : '@имя';
+        const hint = form.querySelector('[data-gateway-hint]');
+        if (hint) hint.hidden = event.target.value !== 'YouTube';
       }
     }
   });

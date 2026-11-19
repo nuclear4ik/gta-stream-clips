@@ -48,25 +48,49 @@ def archive_rows(user, headers):
                             headers, "Записи выбранного канала Twitch")
 
 
-def channel_archives(stream, rows, current, known_live, *, exact=False):
-    user = stream["twitch_user"]
-    lang = stream["lang"]
-    broadcasts = known_live | {(lang, stream["stream_id"])}
+def optional_archive_rows(user, archives, headers):
+    if user not in archives:
+        try:
+            archives[user] = archive_rows(user, headers)
+        except discovery.ConnectionProblem:
+            archives[user] = []
+    return archives[user]
+
+
+def channel_archives(channel, rows, current, known_live, *, exact=False):
+    user, lang = channel["twitch_user"], channel["lang"]
+    stream_id = channel.get("stream_id")
+    broadcasts = known_live | {(lang, stream_id)} if stream_id else known_live
     for row in rows:
         if row.get("user_id") != user or row.get("viewable") != "public":
             continue
-        if exact and row.get("stream_id") != stream["stream_id"]:
+        if exact and (not stream_id or row.get("stream_id") != stream_id):
             continue
-        item = regional.twitch_item(row, lang, stream["twitch_login"], current, live=False,
+        item = regional.twitch_item(row, lang, channel["twitch_login"], current, live=False,
                                     known_live=broadcasts)
         if item:
-            item.update(stream_id=row.get("stream_id"), archive_id=row["id"], game_id=stream["game_id"],
-                        viewer_count=stream["viewer_count"])
-            if exact:
-                item["directory_followup"] = True
+            item.update(stream_id=row.get("stream_id"), archive_id=row["id"], game_id=channel["game_id"],
+                        viewer_count=channel.get("viewer_count", 0))
+            if "directory_rank" in channel and not exact:
+                item["directory_rank"] = channel["directory_rank"]
             else:
-                item["directory_rank"] = stream["directory_rank"]
+                item["directory_followup"] = True
             yield item
+
+
+def configured_ru_archives(archives, headers, current, known_live, game_id):
+    if "STREAMCUT_TWITCH_RU" not in os.environ:
+        return
+    try:
+        channels = discovery.twitch_channels({"RU": "ru"}, {"RU": discovery.twitch_authors("RU")}, headers)
+    except discovery.ConnectionProblem:
+        return
+    for user, (login, _) in channels.items():
+        if user in archives:
+            continue  # Current top channels are already covered.
+        channel = dict(twitch_user=user, twitch_login=login, lang="RU", game_id=game_id)
+        rows = optional_archive_rows(user, archives, headers)
+        yield from channel_archives(channel, rows, current, known_live)
 
 
 def previous_selection(entries, lang, game_id, current):
@@ -92,12 +116,8 @@ def follow_archives(selected, previous, archives, headers, current):
         if item["kind"] != "live" or (key, "live") in seen or (key, "vod") in seen:
             continue
         user = item["twitch_user"]
-        if user not in archives:
-            try:
-                archives[user] = archive_rows(user, headers)
-            except discovery.ConnectionProblem:
-                archives[user] = []
-        matched = next(channel_archives(item, archives[user], current, set(), exact=True), None)
+        rows = optional_archive_rows(user, archives, headers)
+        matched = next(channel_archives(item, rows, current, set(), exact=True), None)
         if matched:
             selected.append(matched)
             seen.add((key, "vod"))
@@ -107,7 +127,7 @@ def follow_archives(selected, previous, archives, headers, current):
 
 
 def search(languages, current, *, known_live=(), previous=None):
-    """Return ranked streams, their recent archives and follow-ups from prior polls."""
+    """Return ranked streams and recent archives from ranked or explicitly followed channels."""
     client = os.environ.get("TWITCH_CLIENT_ID")
     secret = os.environ.get("TWITCH_CLIENT_SECRET")
     if not client or not secret:
@@ -124,6 +144,8 @@ def search(languages, current, *, known_live=(), previous=None):
             user = stream["twitch_user"]
             archives[user] = archive_rows(user, headers)
             selected.extend(channel_archives(stream, archives[user], current, known_live))
+        if lang == "RU":
+            selected.extend(configured_ru_archives(archives, headers, current, known_live, game_id))
         retained = list(previous_selection(previous.get(lang, ()), lang, game_id, current))
         follow_archives(selected, retained, archives, headers, current)
         results[lang] = selected

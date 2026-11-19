@@ -49,7 +49,7 @@ h2 { margin: 0; font-size: 17px; }
 .heading p { margin: 9px 0 0; font-size: 13px; }
 .heading p span { padding-inline: 3px; }
 .surface { border: 1px solid var(--line); border-radius: 13px; background: var(--panel); overflow: hidden; min-width: 0; }
-.market-grid, .roster-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+.market-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
 .market-grid { margin-bottom: 16px; }
 .market {
   display: flex; align-items: center; justify-content: space-between; gap: 8px;
@@ -59,11 +59,11 @@ h2 { margin: 0; font-size: 17px; }
 .market-label small { font-weight: 400; }
 .market strong { flex-shrink: 0; font-size: clamp(23px, 4vw, 31px); font-variant-numeric: tabular-nums; }
 .market strong span { color: var(--sub); font-size: .52em; }
-.roster-grid { padding: 14px 18px; border-top: 1px solid var(--line); }
-.roster-grid strong { font-size: 13px; }
-.roster-grid small { line-height: 1.45; }
-.roster-grid ol { margin: 8px 0 0; padding-inline-start: 21px; font-size: 12px; }
-.roster-grid li { margin-top: 4px; overflow-wrap: anywhere; }
+.source-roster { padding: 14px 18px; border-top: 1px solid var(--line); }
+.source-roster strong { font-size: 13px; }
+.source-roster small { line-height: 1.45; }
+.source-roster ol { margin: 8px 0 0; padding-inline-start: 21px; font-size: 12px; }
+.source-roster li { margin-top: 4px; overflow-wrap: anywhere; }
 .bar, .job, .account, .account-head { display: flex; align-items: center; gap: 14px; padding: 14px 18px; }
 .bar, .account { justify-content: space-between; }
 .bar .muted { font-size: 12px; }
@@ -159,7 +159,7 @@ video { max-height: min(65vh, 660px); max-width: 100%; }
   main { padding-top: 24px; }
   .job, .job.source, .job.job-ready { grid-template-columns: minmax(0, 1fr); padding: 12px; gap: 8px; }
   .job-actions { justify-content: flex-start; }
-  .bar, .account, .account-head, .roster-grid, .route-head, .route-row { padding-inline: 12px; }
+  .bar, .account, .account-head, .source-roster, .route-head, .route-row { padding-inline: 12px; }
   .job-actions button, .job-actions .status { font-size: 11px; }
   .market-grid { gap: 6px; }
   .market { flex-direction: column; align-items: flex-start; min-height: 92px; padding: 9px; }
@@ -169,5 +169,4 @@ video { max-height: min(65vh, 660px); max-width: 100%; }
   .account { grid-template-columns: minmax(0,1fr) auto; gap: 10px; }
   .account .metrics { grid-column: 1 / -1; grid-row: 2; }
   .account > .quiet { grid-column: 2; grid-row: 1; }
-  .roster-grid { grid-template-columns: 1fr; }
 }

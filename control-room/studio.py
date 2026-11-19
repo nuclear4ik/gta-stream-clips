@@ -120,6 +120,8 @@ def source_url(raw):
         if re.fullmatch(r"[a-zA-Z0-9_-]{11}", video):
             return f"https://www.youtube.com/watch?v={video}", f"youtube:{video}"
     elif host == "twitch.tv":
+        if m := re.fullmatch(r"/[a-zA-Z0-9_]{3,25}/clip/([a-zA-Z0-9_-]{1,160})/?", url.path):
+            return f"https://clips.twitch.tv/{m[1]}", f"twitch:clip:{m[1]}"
         if m := re.fullmatch(r"/videos/([0-9]+)/?", url.path):
             return f"https://www.twitch.tv/videos/{m[1]}", f"twitch:vod:{m[1]}"
         if m := re.fullmatch(r"/([a-zA-Z0-9_]{3,25})/?", url.path):
@@ -127,7 +129,10 @@ def source_url(raw):
             if login not in {"directory", "settings", "downloads", "subscriptions", "inventory",
                              "wallet", "search", "videos"}:
                 return f"https://www.twitch.tv/{login}", f"twitch:live:{login}"
-    raise ValueError("Укажите конкретное видео YouTube, запись или канал Twitch.")
+    elif host == "clips.twitch.tv":
+        if m := re.fullmatch(r"/([a-zA-Z0-9_-]{1,160})/?", url.path):
+            return f"https://clips.twitch.tv/{m[1]}", f"twitch:clip:{m[1]}"
+    raise ValueError("Укажите конкретное видео YouTube, запись, клип или канал Twitch.")
 
 
 ACCOUNTS_SCHEMA = """(
@@ -321,6 +326,7 @@ class Studio:
                 "clips": clips, "queue": queue, "files": self.available_files(300),
                 "routes": {r: transport.route_available(r) for r in transport.REGIONS},
                 "oauth": transport.youtube_configured(), "uploads": self.uploads_enabled(),
+                "youtube_gateway_required": transport.youtube_gateway_required(),
                 "search_configured": search_configured(), "search_status": self.search_status}
 
     @staticmethod
@@ -578,6 +584,7 @@ class Studio:
             if (account["platform"] != "YouTube" or account["lang"] != "RU" or
                     not account["refresh_token"] or not self.uploads_enabled()):
                 raise ValueError("Подключите RU-канал YouTube и включите планирование на сервере.")
+            transport.require_youtube_write_route(account["route"])
             transport.prepare_upload(account)
         with self.db() as db:
             current = db.execute("""UPDATE accounts SET auto=? WHERE id=? AND target=? AND route=?
@@ -597,6 +604,8 @@ class Studio:
             return f"youtube:{matched[1]}", f"https://www.youtube.com/watch?v={matched[1]}"
         if matched := re.fullmatch(r"twitch-vod-([0-9]{1,30})", stem):
             return f"twitch:vod:{matched[1]}", f"https://www.twitch.tv/videos/{matched[1]}"
+        if matched := re.fullmatch(r"twitch-clip-([a-zA-Z0-9_-]{1,160})", stem):
+            return f"twitch:clip:{matched[1]}", f"https://clips.twitch.tv/{matched[1]}"
         if matched := re.fullmatch(r"twitch-stream-([0-9]{1,30})", stem):
             return f"twitch:stream:{matched[1]}", ""
         return None
@@ -1015,7 +1024,7 @@ class Studio:
         collected = {(row["route"], row["platform"]): row for row in rows}
         threshold = iso(now() - timedelta(minutes=3))
         results = []
-        for route in ("RU", "US", "ES", "server"):
+        for route in (transport.GATEWAY, "RU", "US", "ES", "server"):
             for platform in transport.API_HOSTS:
                 row = collected.get((route, platform))
                 if not transport.route_available(route):
@@ -1040,14 +1049,18 @@ class Studio:
                 WHERE excluded.checked_at>=route_health.checked_at""", result)
             if not saved.rowcount:
                 if checking_id is not None:
-                    db.execute("UPDATE queue SET status='scheduled' WHERE id=? AND status='checking'", (checking_id,))
+                    db.execute("""UPDATE queue SET status='scheduled' WHERE id=?
+                        AND status IN ('checking','sending')""", (checking_id,))
+                return
+            if platform == "YouTube" and not transport.youtube_write_route_allowed(route):
                 return
             if result["state"] != "ok":
                 db.execute("""UPDATE queue SET status='route_wait',detail=? WHERE status='scheduled'
                     AND account_id IN (SELECT id FROM accounts WHERE route=? AND platform=?)""",
                            (result["detail"], route, platform))
                 if checking_id is not None:
-                    db.execute("UPDATE queue SET status='route_wait',detail=? WHERE id=? AND status='checking'",
+                    db.execute("""UPDATE queue SET status='route_wait',detail=? WHERE id=?
+                        AND status IN ('checking','sending')""",
                                (result["detail"], checking_id))
                 return
             recovered = db.execute("""SELECT q.id,q.account_id,q.at,a.lang FROM queue q
@@ -1124,7 +1137,9 @@ class Studio:
         requested = datetime.fromisoformat(job["at"])
         reserved = [datetime.fromisoformat(date) for date in remote_dates]
         day_start, day_end = schedule.civil_day(requested, job["lang"])
+        automatic = job["auto_scheduled"] == 1
         if (requested >= earliest and sum(day_start <= stamp < day_end for stamp in reserved) < schedule.DAY_LIMIT
+                and (not automatic or schedule.in_release_window(requested, job["lang"]))
                 and all(abs(stamp - requested) >= timedelta(hours=1) for stamp in reserved)):
             return requested
         return schedule.available_slot(max(earliest, requested), job["lang"], reserved)
@@ -1195,9 +1210,11 @@ class Studio:
         account = self.get_account(job["account_id"])
         if not account["refresh_token"]:
             raise ValueError("Подключите канал YouTube через OAuth.")
+        transport.require_youtube_write_route(account["route"])
         token = transport.prepare_upload(account)
         try:
-            youtube_release.reschedule(account["route"], token, job["external_id"], planned)
+            youtube_release.reschedule(account["route"], token, job["external_id"], planned,
+                                       expected_channel=account["target"])
         except youtube_release.ScheduleUncertain:
             self.upload_status(job["id"], "remote_check", "Проверяем новый час в YouTube.", at=iso(planned))
             raise
@@ -1216,7 +1233,12 @@ class Studio:
                 self.hold_unapproved_youtube_uploads(db, allowed)
                 if allowed:
                     self.promote_automatic_youtube(db, allowed)
-            job = db.execute("""SELECT q.id,q.account_id,q.at,c.title,c.lang,c.relative_path,c.description,c.hashtags
+            if transport.youtube_gateway_required():
+                db.execute("""UPDATE queue SET status='route_wait',detail=? WHERE status='scheduled'
+                    AND external_id IS NULL AND account_id IN (SELECT id FROM accounts
+                            WHERE platform='YouTube' AND lang='RU' AND route<>?)""",
+                           (transport.GATEWAY_REQUIRED_DETAIL, transport.GATEWAY))
+            job = db.execute("""SELECT q.id,q.account_id,q.at,q.auto_scheduled,c.title,c.lang,c.relative_path,c.description,c.hashtags
                                 FROM queue q JOIN clips c ON c.id=q.clip_id JOIN accounts a ON a.id=q.account_id
                                 WHERE q.status='scheduled' AND q.external_id IS NULL AND a.platform='YouTube'
                                 AND a.lang='RU' AND (q.retry_at IS NULL OR q.retry_at<=?)
@@ -1229,6 +1251,7 @@ class Studio:
             db.execute("UPDATE queue SET status='checking' WHERE id=?", (job["id"],))
         account = self.get_account(job["account_id"])
         try:
+            transport.require_youtube_write_route(account["route"])
             path = (self.output / job["relative_path"]).resolve()
             if not path.is_relative_to(self.output) or not path.is_file() or not account["refresh_token"]:
                 raise ValueError("Клип или OAuth-подключение канала недоступны.")
@@ -1250,9 +1273,8 @@ class Studio:
         except youtube_release.SlotUnavailable as error:
             self.slot_wait(account["id"], error.retry_after_seconds, str(error))
             return
-        except transport.RouteProblem as error:
-            self.record_connection(dict(route=account["route"], platform=account["platform"], state="failed",
-                                        country=None, detail=str(error), checked_at=iso(now())), job["id"])
+        except (transport.RouteProblem, transport.NetworkProblem) as error:
+            self.hold_for_youtube_route(account, job["id"], error)
             return
         except (transport.ConnectionProblem, ValueError, OSError, subprocess.SubprocessError, KeyError) as error:
             self.upload_status(job["id"], "blocked", str(error)[:350])
@@ -1280,12 +1302,16 @@ class Studio:
                 account["route"], token, title=job["title"], description=job["description"] or description,
                 tags=json.loads(job["hashtags"]) or tags, lang=job["lang"], path=path, publish_at=planned,
                 license=os.environ.get("STREAMCUT_YOUTUBE_LICENSE", "youtube"), made_for_kids=False,
+                expected_channel=account["target"],
             )
         except youtube_release.SlotUnavailable as error:
             self.slot_wait(account["id"], error.retry_after_seconds, str(error))
             return
         except (youtube_release.UploadRejected, ValueError) as error:
             self.upload_status(job["id"], "blocked", str(error)[:350])
+            return
+        except transport.RouteProblem as error:
+            self.hold_for_youtube_route(account, job["id"], error)
             return
         except (transport.ConnectionProblem, OSError):
             self.upload_status(job["id"], "unknown", "Проверьте YouTube Studio перед повтором.")
@@ -1297,6 +1323,13 @@ class Studio:
         except transport.ConnectionProblem:
             return
         self.apply_youtube_status(dict(id=job["id"],status="remote_check"), video, now())
+
+    def hold_for_youtube_route(self, account, identifier, error):
+        if not transport.youtube_write_route_allowed(account["route"]):
+            self.upload_status(identifier, "route_wait", transport.GATEWAY_REQUIRED_DETAIL)
+            return
+        self.record_connection(dict(route=account["route"], platform=account["platform"], state="failed",
+                                    country=None, detail=str(error), checked_at=iso(now())), identifier)
 
     @staticmethod
     def promote_automatic_youtube(db, allowed, account_id=None):
