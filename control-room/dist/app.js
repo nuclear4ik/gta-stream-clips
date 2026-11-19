@@ -17,6 +17,10 @@
   const maxTranscriptBytes = 512 * 1024;
   const labels = {
     waiting: 'Нужен исходный файл', waiting_layout: 'Нужны границы камеры', queued: 'В работе', editing: 'Монтируется', ready: 'Готово',
+    twitch_wait_archive: 'Ожидает архив Twitch', twitch_wait_check: 'Ожидает проверки записи',
+    twitch_wait_access: 'Нужен доступ к исходнику', twitch_wait_media: 'Ожидает автополучения',
+    twitch_media_missing: 'Файл пока недоступен', twitch_media_error: 'Ошибка автополучения',
+    twitch_paused: 'Автополучение отложено',
     empty: 'Моменты не найдены', failed: 'Ошибка монтажа', review: 'Готов к планированию',
     scheduled: 'Ждёт слота YouTube', preloaded: 'Запланировано в YouTube',
     checking: 'Проверка подключения', sending: 'Загружается в YouTube', remote_check: 'YouTube проверяет расписание',
@@ -222,12 +226,13 @@
 
   function sourceCard(source, clips) {
     const id = escape(source.id);
+    const detailClass = !source.media_state || source.media_state === 'twitch_media_error' ? ' class="error-note"' : '';
     return `<article class="job source">
       <div class="job-title">${badge(source.lang)}<div><strong>${escape(source.title)}</strong>
         ${source.url ? '<a class="muted" href="' + escape(source.url) + '" target="_blank" rel="noopener noreferrer">Ссылка ↗</a>' : ''}
         ${source.kind === 'live' ? '<small>Эфир при последней проверке</small>' : source.kind === 'vod' ? '<small>Запись эфира</small>' : ''}
-        ${source.detail ? '<small class="error-note">' + escape(source.detail) + '</small>' : ''}</div></div>
-      <div class="job-actions">${status(source.status)}
+        ${source.detail ? '<small' + detailClass + '>' + escape(source.detail) + '</small>' : ''}</div></div>
+      <div class="job-actions">${status(labels[source.media_state] ? source.media_state : source.status)}
         ${configurableSources.has(source.status) ? '<button data-do="source" data-id="' + id + '">' +
           (source.status === 'waiting' ? 'Добавить исходник' : 'Настроить монтаж') + '</button>' : ''}
         ${source.status === 'waiting' ? '<button class="quiet" data-do="dismiss" data-id="' + id + '">Скрыть</button>' : ''}</div>

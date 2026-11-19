@@ -1,6 +1,7 @@
 """Regression tests for the route gate and the persistent publishing queue."""
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
+import os
 import sqlite3
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -16,6 +17,7 @@ import youtube_release
 FIRST_VIDEO = "AbC012_defG"
 SECOND_VIDEO = "XYz012_defG"
 OTHER_VIDEO = "DEf012_defG"
+AUTO_SOURCES = "STREAMCUT_YOUTUBE_AUTO_TWITCH_BROADCASTERS"
 
 
 class PublishingTests(unittest.TestCase):
@@ -26,6 +28,8 @@ class PublishingTests(unittest.TestCase):
         self.addCleanup(self.s.close)
         self.clock = datetime(2026, 11, 19, 5, tzinfo=timezone.utc)
         self.start_mock(patch("studio.now", side_effect=lambda: self.clock))
+        self.start_mock(patch.dict(os.environ))
+        os.environ.pop(AUTO_SOURCES, None)
         self.start_mock(patch.object(studio.Studio, "uploads_enabled", return_value=True))
         self.start_mock(patch.object(studio.Studio, "shorts_valid", return_value=True))
         self.start_mock(patch("transport.request", side_effect=AssertionError("Unexpected network request")))
@@ -53,10 +57,15 @@ class PublishingTests(unittest.TestCase):
         with self.s.db() as db:
             db.execute("UPDATE queue SET at=? WHERE id=?", (studio.iso(instant), identifier))
 
-    def add_pending(self, title, instant):
+    def add_pending(self, title, instant, broadcaster=None):
         with self.s.db() as db:
-            clip = db.execute("""INSERT INTO clips(lang,title,relative_path,verified)
-                VALUES ('RU',?,'clip.mp4',1) RETURNING id""", (title,)).fetchone()[0]
+            source = None
+            if broadcaster is not None:
+                source = db.execute("""INSERT INTO sources(lang,title,url,status,created,twitch_broadcaster)
+                    VALUES ('RU',?,'https://www.twitch.tv/videos/1','ready',?,?) RETURNING id""",
+                    (title, studio.iso(self.clock), broadcaster)).fetchone()[0]
+            clip = db.execute("""INSERT INTO clips(source_id,lang,title,relative_path,verified)
+                VALUES (?,'RU',?,'clip.mp4',1) RETURNING id""", (source, title)).fetchone()[0]
             self.s.populate(db)
             return db.execute("UPDATE queue SET at=? WHERE clip_id=? RETURNING id",
                               (studio.iso(instant), clip)).fetchone()[0]
@@ -114,6 +123,67 @@ class PublishingTests(unittest.TestCase):
         self.prepare.assert_not_called()
         self.upload.assert_not_called()
         self.assertEqual(self.s.snapshot()["queue"][0]["status"], "review")
+
+    def test_populate_and_auto_enable_use_exact_trusted_twitch_broadcaster(self):
+        os.environ[AUTO_SOURCES] = "21, 10"
+        instant = self.clock + timedelta(hours=3)
+        approved = self.add_pending("Разрешённый источник", instant, "10")
+        unmatched = self.add_pending("Другой источник", instant, "210")
+        unknown = self.add_pending("Без связанного источника", instant)
+        account = next(a["id"] for a in self.s.snapshot()["accounts"] if a["lang"] == "RU")
+        for enable_again in (False, True):
+            if enable_again:
+                self.s.auto_account(account, False)
+                self.s.auto_account(account, True)
+            statuses = {job["id"]: job["status"] for job in self.s.snapshot()["queue"]}
+            self.assertEqual((statuses[approved], statuses[unmatched], statuses[unknown]),
+                             ("scheduled", "review", "review"))
+
+    def test_revoked_automatic_and_legacy_jobs_wait_but_manual_send_is_unchanged(self):
+        legacy = self.s.snapshot()["queue"][0]["id"]
+        with self.s.db() as db:
+            db.execute("UPDATE queue SET auto_scheduled=NULL WHERE id=?", (legacy,))
+        instant = self.clock + timedelta(hours=4)
+        os.environ[AUTO_SOURCES] = "10"
+        automatic = self.add_pending("Разрешение позднее снято", instant, "10")
+        manual_at = (instant + timedelta(hours=1)).astimezone(schedule.ZONES["RU"]).strftime("%Y-%m-%dT%H:%M")
+        self.s.queue_action({"id": legacy, "action": "send", "at": manual_at})
+        blocked = self.add_pending("Другое задание без происхождения", instant)
+        with self.s.db() as db:
+            db.execute("UPDATE queue SET status='scheduled',auto_scheduled=NULL WHERE id=?", (blocked,))
+        os.environ[AUTO_SOURCES] = "11"
+        self.status.side_effect = self.confirm_last_upload
+        self.s.publish_one()
+        self.upload.assert_called_once()
+        self.assertEqual(self.upload.call_args.kwargs["title"], "Тест")
+        statuses = {job["id"]: job["status"] for job in self.s.snapshot()["queue"]}
+        self.assertEqual((statuses[legacy], statuses[automatic], statuses[blocked]),
+                         ("preloaded", "review", "review"))
+
+    def test_empty_or_invalid_allowlist_never_opens_automatic_publication(self):
+        for value in ("", "10,bad"):
+            os.environ[AUTO_SOURCES] = value
+            row = self.add_pending("Известный канал", self.clock + timedelta(hours=2), "10")
+            self.assertEqual(next(job["status"] for job in self.s.snapshot()["queue"] if job["id"] == row), "review")
+        self.s.publish_one()
+        self.prepare.assert_not_called()
+        self.upload.assert_not_called()
+
+    def test_new_broadcaster_approval_uses_existing_render_without_account_toggle(self):
+        os.environ[AUTO_SOURCES] = ""
+        instant = self.clock + timedelta(hours=3)
+        approved = self.add_pending("Архив готов к выпуску", instant, "10")
+        waiting = self.add_pending("Архив другого автора", instant, "11")
+        self.s.publish_one()
+        self.upload.assert_not_called()
+
+        os.environ[AUTO_SOURCES] = "10"
+        self.status.side_effect = self.confirm_last_upload
+        self.s.publish_one()
+        self.upload.assert_called_once()
+        self.assertEqual(self.upload.call_args.kwargs["title"], "Архив готов к выпуску")
+        statuses = {job["id"]: job["status"] for job in self.s.snapshot()["queue"]}
+        self.assertEqual((statuses[approved], statuses[waiting]), ("preloaded", "review"))
 
     def test_full_remote_slots_wait_then_preload_oldest_in_order(self):
         first = self.s.snapshot()["queue"][0]["id"]

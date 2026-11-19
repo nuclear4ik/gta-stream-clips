@@ -2,6 +2,7 @@
 
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
+import json
 import os
 from pathlib import Path
 import stat
@@ -41,6 +42,39 @@ class FakeResponse(BytesIO):
 
 
 class TwitchMediaTests(unittest.TestCase):
+    def test_receives_creator_archive_only_for_exact_vod_and_broadcaster(self):
+        with TemporaryDirectory() as folder, patch("discovery.helix") as helix, patch(
+                "twitch_media.HTTPSConnection") as connect:
+            target = Path(folder) / "twitch-vod-10.mp4"
+            index = Path(folder) / "archive-index.json"
+            index.write_text(json.dumps({"10": {"broadcaster_id": "11",
+                                                "url": "https://media.example.com/vod.mp4?signature=private"}}))
+            with patch.dict(os.environ, {twitch_media.ARCHIVE_INDEX: str(index)}, clear=True):
+                self.assertTrue(twitch_media.configured())
+                self.assertTrue(twitch_media.configured(VOD))
+                self.assertFalse(twitch_media.configured(VOD | {"twitch_user": "22"}))
+                self.assertIsNone(twitch_media.fetch(VOD | {"twitch_user": "22"}, target))
+                connection = connect.return_value
+                connection.getresponse.return_value = FakeResponse(FILE, str(len(FILE)))
+                self.assertEqual(twitch_media.fetch(VOD, target, current=CURRENT), target)
+                self.assertEqual(target.read_bytes(), FILE)
+                connect.assert_called_once_with("media.example.com", timeout=20)
+                connection.request.assert_called_once_with("GET", "/vod.mp4?signature=private")
+                helix.assert_not_called()
+
+    def test_invalid_archive_index_is_ignored_without_request(self):
+        with TemporaryDirectory() as folder, patch("twitch_media.HTTPSConnection") as connect:
+            index = Path(folder) / "index.json"
+            target = Path(folder) / "clip.mp4"
+            with patch.dict(os.environ, {twitch_media.ARCHIVE_INDEX: str(index)}, clear=True):
+                for value in (None, b"{", b"[]", b'{"10":{"broadcaster_id":"11","url":"http://media.example.com/vod"}}'):
+                    if value is not None:
+                        index.write_bytes(value)
+                    self.assertFalse(twitch_media.configured(VOD))
+                    self.assertIsNone(twitch_media.fetch(VOD, target))
+            connect.assert_not_called()
+            self.assertFalse(target.exists())
+
     def test_downloads_matching_clip_and_keeps_bearer_off_cdn_request(self):
         rows = [
             clip("irrelevant", video_id="12", view_count=1000),

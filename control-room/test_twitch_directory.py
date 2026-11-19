@@ -2,11 +2,14 @@
 
 from datetime import datetime, timedelta, timezone
 import os
+from pathlib import Path
+from tempfile import TemporaryDirectory
 import unittest
 from unittest.mock import patch
 
 import discovery
 import regional
+from studio import Studio
 import twitch_directory
 
 
@@ -101,6 +104,100 @@ class TwitchDirectoryTests(unittest.TestCase):
             with self.assertRaisesRegex(discovery.ConnectionProblem, "Grand Theft Auto VI"):
                 twitch_directory.search(LANGUAGES, current)
             helix.assert_called_once()
+
+    def test_selected_stream_is_checked_after_leaving_rank_and_after_restart(self):
+        current = datetime(2026, 11, 19, 8, tzinfo=timezone.utc)
+        phase = 0
+        video_queries = []
+
+        def feed(endpoint, params, _headers, _action):
+            options = dict(params)
+            if endpoint == "games":
+                return [{"id": GAME, "name": "Grand Theft Auto VI"}]
+            if endpoint == "streams":
+                if options["language"] != "ru":
+                    return []
+                return [live(1 if phase == 0 else 2, "ru", 100)]
+            user = options["user_id"]
+            video_queries.append((phase, user))
+            if user == "1" and phase == 1:
+                raise discovery.ConnectionProblem("Временно нет ответа Twitch.")
+            if user == "1" and phase == 2:
+                return [archive(1, "ru", current, id="9999", stream_id="1234", title="Играем в GTA VI"),
+                        archive(1, "ru", current)]
+            return []
+
+        with TemporaryDirectory() as root, patch.dict(os.environ, SECRETS, clear=True), patch(
+                "studio.now", side_effect=lambda: current), patch("discovery.twitch_headers", return_value={}), patch(
+                "discovery.helix", side_effect=feed):
+            service = Studio(Path(root))
+            try:
+                service.search(force=True)
+                with service.db() as db:
+                    initial = db.execute("SELECT id,kind FROM sources WHERE source_key='twitch:stream:1001'").fetchone()
+                    self.assertEqual(initial["kind"], "live")
+                phase = 1
+                current += timedelta(hours=5)
+                service.search(force=True)
+                with service.db() as db:
+                    roster, _, _ = service.current_discovery(db, current)
+                self.assertEqual(roster["RU"], ["Author 2"])
+            finally:
+                service.close()
+
+            phase = 2
+            current += timedelta(hours=5)
+            service = Studio(Path(root))
+            try:
+                service.search(force=True)
+                phase = 3
+                current += timedelta(hours=5)
+                service.search(force=True)
+                with service.db() as db:
+                    roster, _, candidates = service.current_discovery(db, current)
+                    resolved = db.execute("SELECT id,kind,url,status FROM sources WHERE id=?",
+                                          (initial["id"],)).fetchone()
+                    self.assertEqual(tuple(resolved), (initial["id"], "vod", "https://www.twitch.tv/videos/3001", "waiting"))
+                self.assertEqual(roster["RU"], ["Author 2"])
+                vods = [item for item in candidates["RU"][1] if item["kind"] == "vod"]
+                self.assertEqual([item["archive_id"] for item in vods], ["3001"])
+                self.assertNotIn("directory_rank", vods[0])
+            finally:
+                service.close()
+        self.assertEqual(video_queries, [(0, "1"), (1, "2"), (1, "1"), (2, "2"), (2, "1"), (3, "2")])
+
+    def test_total_failure_preserves_feed_until_retry_in_five_minutes(self):
+        current = datetime(2026, 11, 19, 8, tzinfo=timezone.utc)
+        with TemporaryDirectory() as root, patch.dict(os.environ, SECRETS, clear=True), patch(
+                "studio.now", side_effect=lambda: current), patch("discovery.twitch_headers", return_value={}), patch(
+                "discovery.helix", side_effect=[
+                    [{"id": GAME, "name": "Grand Theft Auto VI"}], [live(1, "ru", 100)], [], [], [],
+                    discovery.ConnectionProblem("Временно нет ответа Twitch."),
+                    [{"id": GAME, "name": "Grand Theft Auto VI"}], [live(2, "ru", 100)], [], [], [], [],
+                ]) as helix:
+            service = Studio(Path(root))
+            try:
+                service.search()
+                current += timedelta(hours=5)
+                service.search()
+                self.assertIn("повтор через 5 минут", service.search_status)
+                with service.db() as db:
+                    roster, _, _ = service.current_discovery(db, current)
+                self.assertEqual(roster["RU"], ["Author 1"])
+                current += timedelta(minutes=4)
+                service.search()
+                self.assertEqual(helix.call_count, 6)
+                current += timedelta(minutes=1)
+                service.search()
+                with service.db() as db:
+                    roster, _, _ = service.current_discovery(db, current)
+                self.assertEqual(roster["RU"], ["Author 2"])
+                current += timedelta(minutes=5)
+                before = helix.call_count
+                service.search()
+                self.assertEqual(helix.call_count, before)
+            finally:
+                service.close()
 
 
 if __name__ == "__main__":

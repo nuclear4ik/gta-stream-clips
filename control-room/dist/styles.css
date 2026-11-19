@@ -88,8 +88,8 @@ h2 { margin: 0; font-size: 17px; }
 .language.ESP { background: #4c382d; color: #ffcda6; }
 .status { background: #2c3532; color: #ced6d3; }
 .status.preloaded, .status.uploaded, .status.ready, .status.ok { background: #35452c; color: var(--accent); }
-.status.blocked, .status.failed, .status.unknown { background: #482e2d; color: #ffd2ca; }
-.status.stale, .status.route_wait, .status.scheduled { background: #423729; color: #fbd8a2; }
+.status.blocked, .status.failed, .status.unknown, .status.twitch_media_error { background: #482e2d; color: #ffd2ca; }
+.status.stale, .status.route_wait, .status.scheduled, .status.twitch_wait_access { background: #423729; color: #fbd8a2; }
 .error-note, .form-error { color: #f0bd94; }
 .blank { border-top: 1px solid var(--line); padding: 40px 20px; text-align: center; }
 .blank p { margin: 8px 0; font-size: 13px; color: var(--sub); }

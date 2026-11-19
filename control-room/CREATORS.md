@@ -1,10 +1,25 @@
 # Поиск каналов Twitch
 
-По умолчанию Streamcut повторяет три отдельных фильтра каталога Grand Theft Auto VI и сортирует активные эфиры по текущему количеству зрителей. Для каждого языка берутся первые десять уникальных каналов. Затем сервис проверяет до пяти свежих публичных архивов на канал. Эфир и его архив связываются по `stream_id`. Поиск запускается раз в пять часов. [Twitch Get Streams](https://dev.twitch.tv/docs/api/reference/streams#get-streams) · [Twitch Get Videos](https://dev.twitch.tv/docs/api/reference/videos#get-videos)
+По умолчанию Streamcut повторяет три отдельных фильтра каталога Grand Theft Auto VI и сортирует активные эфиры по текущему количеству зрителей. Для каждого языка берутся первые десять уникальных каналов. Затем сервис проверяет до пяти свежих публичных архивов на канал. Если выбранный стример вышел из топа, сервис до суток отслеживает архив конкретного эфира по `stream_id`. Найденная запись остаётся доступна для получения до истечения окна в три дня. Поиск запускается раз в пять часов. [Twitch Get Streams](https://dev.twitch.tv/docs/api/reference/streams#get-streams) · [Twitch Get Videos](https://dev.twitch.tv/docs/api/reference/videos#get-videos)
 
 Для поиска задайте `TWITCH_CLIENT_ID` и `TWITCH_CLIENT_SECRET`. Чтобы автоматически обработать предоставленную запись, сохраните её в `inbox/RU` как `twitch-vod-<id>.mp4`, где ID берётся из ссылки Twitch на архив. Копируйте под временным расширением и переименовывайте после завершения. В MVP автомонтаж по умолчанию применяется к RU.
 
-Автополучение MP4 использует официальный Twitch Get Clips Download для уже существующих клипов выбранной записи. Для каждого разрешённого канала задайте `STREAMCUT_TWITCH_CLIP_TOKEN_<broadcaster_id>`. Токен автора должен иметь `channel:manage:clips`. Для токена редактора используйте `editor:manage:clips` и укажите `STREAMCUT_TWITCH_CLIP_EDITOR_ID_<broadcaster_id>`. При наличии только ключей поиска карточка ждёт предоставленный файл. [Twitch Get Clips Download](https://dev.twitch.tv/docs/api/reference/clips#get-clips-download)
+Helix возвращает данные об архиве и ссылку на страницу. Готовый MP4 полной записи может предоставить автор, например из Video Producer или собственной записи. Задайте `STREAMCUT_TWITCH_ARCHIVE_INDEX` с абсолютным путём к локальному JSON, который обновляет доверенный поставщик файлов. Ключ — ID записи Twitch, `broadcaster_id` — числовой ID автора в виде строки, `url` — прямая HTTPS-ссылка на MP4. [Twitch Get Videos](https://dev.twitch.tv/docs/api/reference/videos#get-videos) · [Video Producer](https://help.twitch.tv/s/article/video-on-demand?language=en_US)
+
+```json
+{
+  "123456789": {
+    "broadcaster_id": "12345",
+    "url": "https://media.example.com/gta/session.mp4"
+  }
+}
+```
+
+Сервис перечитывает индекс без перезапуска, сопоставляет ID записи и автора с Twitch и сохраняет MP4 в нужную входящую папку. Обновляйте индекс атомарной заменой файла. Подписанные ссылки храните только в приватном индексе. Используйте прямые адреса, возвращающие HTTP 200. Когда есть место в запасе, программа автоматически забирает следующий доступный архив и передаёт его в монтаж.
+
+Если автор предоставляет клипы через Twitch, используйте официальный Get Clips Download. Для каждого разрешённого канала задайте `STREAMCUT_TWITCH_CLIP_TOKEN_<broadcaster_id>`. Токен автора должен иметь `channel:manage:clips`. Для токена редактора используйте `editor:manage:clips` и укажите `STREAMCUT_TWITCH_CLIP_EDITOR_ID_<broadcaster_id>`. Карточка показывает, когда эфир ещё идёт, когда требуется доступ к записи и когда сервис повторит попытку получения. [Twitch Get Clips Download](https://dev.twitch.tv/docs/api/reference/clips#get-clips-download)
+
+Для автоматической предзагрузки роликов Twitch в YouTube укажите в `STREAMCUT_YOUTUBE_AUTO_TWITCH_BROADCASTERS` числовые ID авторов, от которых получено разрешение на публикацию. Разделяйте ID запятыми. При пустом списке готовые ролики остаются на проверке. Это отдельная настройка от доступа к скачиванию. После изменения переменной перезапустите сервис.
 
 Старый поиск по авторам доступен при `STREAMCUT_DISCOVERY_MODE=regional`.
 

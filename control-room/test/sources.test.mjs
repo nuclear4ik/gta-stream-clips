@@ -131,3 +131,21 @@ test('a source with no accounts can expose its clips and the download link', asy
   assert.match(dialog.innerHTML, /<video controls playsinline src="\/media\/2"/);
   assert.match(dialog.innerHTML, /href="\/media\/2" download="streamcut-2\.mp4"/);
 });
+
+test('discovered Twitch sources show their acquisition stage', async () => {
+  const media = [
+    ['twitch_wait_archive', 'Ожидает архив Twitch'],
+    ['twitch_wait_access', 'Нужен доступ к исходнику'],
+    ['twitch_wait_media', 'Ожидает автополучения'],
+    ['twitch_media_error', 'Ошибка автополучения'],
+  ];
+  const sources = media.map(([media_state], index) => ({
+    id: index + 1, lang: 'RU', title: 'Запись', status: 'waiting', media_state, detail: 'Помощь <пользователю>',
+  }));
+  const {app} = await panel(() => assert.fail('source display does not fetch media'), {sources});
+  for (const [state, label] of media) {
+    assert.match(app.innerHTML, new RegExp('status ' + state + '">' + label));
+  }
+  assert.match(app.innerHTML, /Помощь &lt;пользователю&gt;/);
+  assert.doesNotMatch(app.innerHTML, /Нужен исходный файл/);
+});

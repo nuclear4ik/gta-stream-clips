@@ -42,6 +42,8 @@ MEDIA = {".mp4", ".mkv", ".mov", ".webm", ".ts"}
 CHANNEL_RE = re.compile(r"UC[A-Za-z0-9_-]{22}")
 INVENTORY_LIMIT = 10
 PUBLISH_LEAD = timedelta(minutes=15)
+TWITCH_FILE_PENDING = "Автоматическое получение пока не вернуло файл. Сервис проверит запись снова."
+TWITCH_FILE_ERROR = "Проверьте доступ к записи и соединение. Сервис повторит попытку."
 
 
 def now():
@@ -65,6 +67,14 @@ def search_configured():
 def automatic_editing(lang):
     markets = os.environ.get("STREAMCUT_AUTOCUT_LANGS", "RU").split(",")
     return autocut.enabled() and lang in {item.strip().upper() for item in markets}
+
+
+def youtube_auto_broadcasters():
+    raw = os.environ.get("STREAMCUT_YOUTUBE_AUTO_TWITCH_BROADCASTERS")
+    if raw is None:
+        return None
+    ids = {part.strip() for part in raw.split(",") if part.strip()}
+    return ids if all(discovery.TWITCH_ID.fullmatch(value) for value in ids) else set()
 
 
 def clip_metadata(lang, title, url=""):
@@ -132,7 +142,8 @@ CREATE TABLE IF NOT EXISTS sources (
     id INTEGER PRIMARY KEY, lang TEXT NOT NULL, title TEXT NOT NULL, url TEXT NOT NULL,
     source_key TEXT UNIQUE, rel_file TEXT, fingerprint TEXT UNIQUE, mark INTEGER,
     status TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '', created TEXT NOT NULL, kind TEXT, queued_at TEXT,
-    last_seen TEXT, edit_profile TEXT, auto_attempt INTEGER NOT NULL DEFAULT 0, speech_language TEXT
+    last_seen TEXT, edit_profile TEXT, auto_attempt INTEGER NOT NULL DEFAULT 0, speech_language TEXT,
+    twitch_broadcaster TEXT
 );
 CREATE TABLE IF NOT EXISTS discovery_feeds (
     lang TEXT NOT NULL, provider TEXT NOT NULL, checked_at TEXT NOT NULL, payload TEXT NOT NULL,
@@ -158,6 +169,7 @@ CREATE TABLE IF NOT EXISTS queue (
     id INTEGER PRIMARY KEY, clip_id INTEGER NOT NULL REFERENCES clips(id),
     account_id INTEGER NOT NULL REFERENCES accounts(id), at TEXT NOT NULL,
     status TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '', external_id TEXT, sent_at TEXT, retry_at TEXT,
+    auto_scheduled INTEGER,
     UNIQUE(clip_id, account_id)
 );
 """
@@ -199,10 +211,11 @@ class Studio:
             if "queued_at" not in source_columns:
                 db.execute("UPDATE sources SET queued_at=created WHERE rel_file IS NOT NULL")
             for table, columns in (
-                ("sources", {"auto_attempt": "INTEGER NOT NULL DEFAULT 0", "speech_language": "TEXT"}),
+                ("sources", {"auto_attempt": "INTEGER NOT NULL DEFAULT 0", "speech_language": "TEXT",
+                             "twitch_broadcaster": "TEXT"}),
                 ("clips", {"verified": "INTEGER NOT NULL DEFAULT 0", "description": "TEXT NOT NULL DEFAULT ''",
                            "hashtags": "TEXT NOT NULL DEFAULT '[]'"}),
-                ("queue", {"retry_at": "TEXT"}),
+                ("queue", {"retry_at": "TEXT", "auto_scheduled": "INTEGER"}),
             ):
                 existing = {row["name"] for row in db.execute(f"PRAGMA table_info({table})")}
                 for column, definition in columns.items():
@@ -268,8 +281,20 @@ class Studio:
         with self.db() as db:
             settings = {r["name"]: bool(r["value"]) for r in db.execute("SELECT * FROM settings")}
             sources = [dict(row) for row in db.execute("""SELECT id, lang, title, url, rel_file, mark,
-                        status, detail, kind FROM sources WHERE status NOT IN ('dismissed','expired') ORDER BY id DESC LIMIT 300""")]
-            roster, ranking_updated, _ = self.current_discovery(db, now())
+                        status, detail, kind, last_seen, twitch_broadcaster FROM sources
+                        WHERE status NOT IN ('dismissed','expired') ORDER BY id DESC LIMIT 300""")]
+            roster, ranking_updated, ranked = self.current_discovery(db, now())
+            queue_counts = self.ready_counts(db)
+            recordings = {(lang, item["url"]): item for lang, (_, entries) in ranked.items()
+                          for item in entries if item["provider"] == "Twitch" and item["kind"] == "vod"}
+            for source in sources:
+                seen = source.pop("last_seen")
+                broadcaster = source.pop("twitch_broadcaster")
+                discovered = seen is not None or broadcaster is not None
+                if discovered and source["status"] == "waiting" and source["url"].startswith("https://www.twitch.tv/"):
+                    candidate = recordings.get((source["lang"], source["url"]))
+                    source["media_state"], source["detail"] = self.twitch_source_status(
+                        source, candidate, settings["scan"], queue_counts[source["lang"]])
             accounts = []
             for row in db.execute("""SELECT a.id, a.lang, a.platform, a.name, a.target,
                           a.route, a.auto, a.refresh_token IS NOT NULL AS connected, m.payload
@@ -279,7 +304,6 @@ class Studio:
                 item["stats"] = json.loads(payload) if payload else {}
                 accounts.append(item)
             checks = [dict(row) for row in db.execute("SELECT * FROM route_health")]
-            queue_counts = self.ready_counts(db)
             clips = [dict(row) for row in db.execute(
                 "SELECT id, source_id, lang, title,description,hashtags FROM clips ORDER BY id DESC LIMIT 100")]
             for item in clips:
@@ -309,6 +333,24 @@ class Studio:
         return result
 
     @staticmethod
+    def twitch_source_status(source, candidate, scanning, ready):
+        if source["kind"] == "live":
+            return "twitch_wait_archive", "Запись эфира ещё не найдена. Сервис проверит её при обновлении каталога."
+        if candidate is None:
+            return "twitch_wait_check", "Автополучение проверяется после обновления поиска."
+        if not twitch_media.configured(candidate):
+            return "twitch_wait_access", "Для автополучения нужна ссылка на файл от автора или доступ автора или редактора Twitch."
+        if not scanning or not automatic_editing(source["lang"]):
+            return "twitch_paused", "Включите автопоиск и автомонтаж для этого языка."
+        if ready >= INVENTORY_LIMIT:
+            return "twitch_paused", "Сервис получит запись, когда освободится место в очереди."
+        if source["detail"] == TWITCH_FILE_PENDING:
+            return "twitch_media_missing", TWITCH_FILE_PENDING
+        if source["detail"]:
+            return "twitch_media_error", TWITCH_FILE_ERROR
+        return "twitch_wait_media", ""
+
+    @staticmethod
     def uploads_enabled():
         return os.environ.get("STREAMCUT_YOUTUBE_UPLOAD") == "1"
 
@@ -333,9 +375,14 @@ class Studio:
                     "mark": current["mark"], **data}
         lang = language(data)
         url, key = source_url(text_field(data, "url", 2048))
+        kind = data.get("kind") if data.get("kind") in ("live", "vod", "video") else None
+        if kind is None and key.startswith(("twitch:vod:", "twitch:live:")):
+            kind = key.split(":", 2)[1]
         if key_override:
             key = key_override
-        kind = data.get("kind") if data.get("kind") in ("live", "vod", "video") else None
+        twitch_broadcaster = data.get("twitch_user") if discovered_at and data.get("provider") == "Twitch" else None
+        if not isinstance(twitch_broadcaster, str) or not discovery.TWITCH_ID.fullmatch(twitch_broadcaster):
+            twitch_broadcaster = None
         file = text_field(data, "file", 255)
         title = text_field(data, "title", 140)
         mark = data.get("mark")
@@ -374,14 +421,16 @@ class Studio:
             if existing and discovered_at:
                 if existing["lang"] != lang or existing["status"] == "dismissed":
                     return False
-                transition = existing["kind"] == "live" and kind in ("vod", "video")
+                transition = existing["kind"] in (None, "live") and kind in ("vod", "video")
                 refreshed = existing["status"] == "expired"
                 db.execute("""UPDATE sources SET
                               last_seen=CASE WHEN last_seen IS NOT NULL THEN ? ELSE NULL END,
                               status=CASE WHEN status='expired' THEN 'waiting' ELSE status END, url=CASE WHEN ? THEN ? ELSE url END,
-                              title=CASE WHEN ? THEN ? ELSE title END, kind=CASE WHEN ? THEN ? ELSE kind END
+                              title=CASE WHEN ? THEN ? ELSE title END, kind=CASE WHEN ? THEN ? ELSE kind END,
+                              twitch_broadcaster=COALESCE(twitch_broadcaster, ?)
                               WHERE id=?""", (discovered_at, transition, url, transition,
-                                              title or existing["title"], transition, kind, existing["id"]))
+                                              title or existing["title"], transition, kind,
+                                              twitch_broadcaster, existing["id"]))
                 return refreshed
             if existing and existing["status"] == "waiting" and existing["kind"] == "live" and kind == "vod" and not file:
                 db.execute("UPDATE sources SET url=?,title=?,kind=? WHERE id=?",
@@ -402,17 +451,18 @@ class Studio:
                 raise ValueError("Этот файл уже был добавлен.")
             try:
                 if existing:
-                    db.execute("""UPDATE sources SET rel_file=?,fingerprint=?,status=?,mark=?,title=?,queued_at=?,
+                    db.execute("""UPDATE sources SET rel_file=?,fingerprint=?,status=?,mark=?,title=?,queued_at=?,detail='',
                                   edit_profile=COALESCE(?,edit_profile) WHERE id=?""",
                                (file, fingerprint, status, mark, title or Path(file).stem, entered, encoded_profile,
                                 existing["id"]))
                     source_id = existing["id"]
                 else:
                     row = db.execute("""INSERT INTO sources(lang,title,url,source_key,rel_file,fingerprint,mark,
-                        status,created,kind,queued_at,last_seen,edit_profile) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        status,created,kind,queued_at,last_seen,edit_profile,twitch_broadcaster)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                         (lang, title or (Path(file).stem if file else urlsplit(url).netloc or "Новый источник"),
                          url, key or None, file or None, fingerprint, mark, status, entered, kind,
-                         entered if file else None, discovered_at, encoded_profile))
+                         entered if file else None, discovered_at, encoded_profile, twitch_broadcaster))
                     source_id = row.lastrowid
             except sqlite3.IntegrityError:
                 raise ValueError("Этот файл или источник уже был добавлен.") from None
@@ -536,9 +586,7 @@ class Studio:
             if not current.rowcount:
                 raise ValueError("Настройки аккаунта изменились. Повторите действие.")
             if enabled:
-                db.execute("""UPDATE queue SET status='scheduled',detail='',retry_at=NULL
-                    WHERE account_id=? AND status='review' AND external_id IS NULL
-                    AND clip_id IN (SELECT id FROM clips WHERE verified=1)""", (identifier,))
+                self.promote_automatic_youtube(db, youtube_auto_broadcasters(), identifier)
             else:
                 db.execute("UPDATE queue SET status='review',detail='' WHERE account_id=? AND status IN ('scheduled','route_wait')", (identifier,))
 
@@ -615,40 +663,48 @@ class Studio:
                     continue
                 destination = self.input / lang / f"twitch-vod-{archive}.mp4"
                 if destination.exists() or destination.is_symlink():
-                    break
+                    continue
                 self.media_checks[url] = instant + timedelta(minutes=30)
                 try:
-                    twitch_media.fetch(item, destination, current=instant)
-                except (transport.ConnectionProblem, OSError, ValueError) as error:
-                    with self.db() as db:
-                        db.execute("UPDATE sources SET detail=? WHERE id=? AND status='waiting'",
-                                   (str(error)[:350], waiting[lang, url]))
+                    received = twitch_media.fetch(item, destination, current=instant)
+                    detail = "" if received is not None else TWITCH_FILE_PENDING
+                except (transport.ConnectionProblem, OSError, ValueError):
+                    detail = TWITCH_FILE_ERROR
+                with self.db() as db:
+                    db.execute("UPDATE sources SET detail=? WHERE id=? AND status='waiting'",
+                               (detail, waiting[lang, url]))
                 break
 
     @staticmethod
     def current_discovery(db, instant):
         fallback = discovery.roster()
         roster, updated, candidates = {}, {}, {}
+        directory = directory_mode()
         rows = db.execute("SELECT lang,provider,checked_at,payload FROM discovery_feeds").fetchall()
         for lang in LANGS:
             feeds = [row for row in rows if row["lang"] == lang and
                      datetime.fromisoformat(row["checked_at"]) >= instant - discovery.WINDOW and
-                     (not directory_mode() or row["provider"] == "Twitch")]
-            data = regional.current_candidates((item for row in feeds for item in json.loads(row["payload"])), instant)
-            if directory_mode():
-                data = [item for item in data if "directory_rank" in item]
-                by_author = {}
-                for item in sorted(data, key=lambda entry: entry["directory_rank"]):
-                    by_author.setdefault(item["author"], item)
-                board = list(by_author.values())
+                     (not directory or row["provider"] == "Twitch")]
+            entries = [item for row in feeds for item in json.loads(row["payload"])]
+            if directory:
+                data = regional.current_candidates((item for item in entries if "directory_rank" in item or
+                    item.get("directory_followup") and item["kind"] == "vod"), instant)
+                board = []
+                if feeds and datetime.fromisoformat(feeds[0]["checked_at"]) >= instant - timedelta(hours=6):
+                    ranked = regional.current_candidates((item for item in entries if "directory_rank" in item), instant)
+                    by_broadcaster = {}
+                    for item in sorted(ranked, key=lambda entry: entry["directory_rank"]):
+                        by_broadcaster.setdefault(item["twitch_user"], item)
+                    board = list(by_broadcaster.values())
             else:
+                data = regional.current_candidates(entries, instant)
                 board = regional.leaderboard(data)
             candidates[lang] = (board, data)
             if feeds:
                 updated[lang] = max(row["checked_at"] for row in feeds)
                 roster[lang] = [row["creator"] for row in board]
             else:
-                roster[lang] = [] if directory_mode() else fallback.get(lang, [])[:regional.BOARD_SIZE]
+                roster[lang] = [] if directory else fallback.get(lang, [])[:regional.BOARD_SIZE]
         return roster, updated, candidates
 
     def search(self, *, force=False, live_only=False):
@@ -664,34 +720,46 @@ class Studio:
     def search_cycle(self, force, live_only):
         instant = now()
         checked = iso(instant)
-        run_name = "twitch-directory" if directory_mode() else "regional"
+        directory = directory_mode()
+        run_name = "twitch-directory" if directory else "regional"
+        retry_name = "twitch-directory-retry"
         with self.db() as db:
             db.execute("BEGIN IMMEDIATE")
             if not db.execute("SELECT value FROM settings WHERE name='scan'").fetchone()[0]:
                 return
-            previous = db.execute("SELECT started_at FROM discovery_runs WHERE name=?", (run_name,)).fetchone()
-            if not force and previous and datetime.fromisoformat(previous[0]) + timedelta(
-                    seconds=regional.REGIONAL_INTERVAL) > instant:
+            retry = directory and db.execute("SELECT started_at FROM discovery_runs WHERE name=?",
+                                             (retry_name,)).fetchone()
+            previous = retry or db.execute("SELECT started_at FROM discovery_runs WHERE name=?", (run_name,)).fetchone()
+            interval = timedelta(minutes=5) if retry else timedelta(seconds=regional.REGIONAL_INTERVAL)
+            if not force and previous and datetime.fromisoformat(previous[0]) + interval > instant:
                 return
-            if not live_only:
+            if not directory and not live_only:
                 db.execute("INSERT OR REPLACE INTO discovery_runs VALUES (?,?)", (run_name, checked))
             past_live = {(row["lang"], row["source_key"].rsplit(":", 1)[1]) for row in db.execute(
                 """SELECT lang,source_key FROM sources WHERE kind='live' AND source_key LIKE 'twitch:stream:%'
                    AND COALESCE(last_seen,created)>=?""", (iso(instant - discovery.WINDOW),))}
-            _, _, old = self.current_discovery(db, instant)
-            old_twitch = [item for _, entries in old.values() for item in entries
-                          if item["provider"] == "Twitch" and item.get("twitch_login")]
-            active_watch = {item["twitch_user"]: (item["twitch_login"], item["lang"])
-                            for item in old_twitch if item["kind"] == "live"}
-            past_live.update((item["lang"], item["key"].rsplit(":", 1)[1])
-                             for item in old_twitch if item["kind"] == "live")
+            if directory:
+                previous_selection = {row["lang"]: json.loads(row["payload"]) for row in db.execute(
+                    "SELECT lang,payload FROM discovery_feeds WHERE provider='Twitch' AND checked_at>=?",
+                    (iso(instant - discovery.WINDOW),))}
+            else:
+                _, _, old = self.current_discovery(db, instant)
+                old_twitch = [item for _, entries in old.values() for item in entries
+                              if item["provider"] == "Twitch" and item.get("twitch_login")]
+                active_watch = {item["twitch_user"]: (item["twitch_login"], item["lang"])
+                                for item in old_twitch if item["kind"] == "live"}
+                past_live.update((item["lang"], item["key"].rsplit(":", 1)[1])
+                                 for item in old_twitch if item["kind"] == "live")
         updates, errors = [], []
-        if directory_mode():
+        if directory:
             try:
-                twitch = twitch_directory.search(LANGS, instant, known_live=past_live)
+                twitch = twitch_directory.search(LANGS, instant, known_live=past_live, previous=previous_selection)
                 updates.extend((lang, "Twitch", rows) for lang, rows in (twitch or {}).items())
             except transport.ConnectionProblem as error:
-                errors.append(str(error))
+                with self.db() as db:
+                    db.execute("INSERT OR REPLACE INTO discovery_runs VALUES (?,?)", (retry_name, checked))
+                self.search_status = f"{error} · повтор через 5 минут"
+                return
         else:
             for lang, code in LANGS.items():
                 try:
@@ -707,11 +775,16 @@ class Studio:
                 errors.append(str(error))
         with self.db() as db:
             db.execute("BEGIN IMMEDIATE")
+            if directory and updates:
+                db.execute("DELETE FROM discovery_runs WHERE name=?", (retry_name,))
+                db.execute("INSERT OR REPLACE INTO discovery_runs VALUES (?,?)", (run_name, checked))
             for lang, provider, items in updates:
-                if live_only and not directory_mode():
-                    cached = [item for item in old[lang][1] if item["provider"] == provider and item["kind"] != "live"]
-                    items = [*cached, *items]
-                items = regional.current_candidates(items, instant)
+                if not directory:
+                    if live_only:
+                        cached = [item for item in old[lang][1]
+                                  if item["provider"] == provider and item["kind"] != "live"]
+                        items = [*cached, *items]
+                    items = regional.current_candidates(items, instant)
                 db.execute("INSERT OR REPLACE INTO discovery_feeds VALUES (?,?,?,?)",
                            (lang, provider, checked, json.dumps(items, ensure_ascii=False)))
             _, _, candidates = self.current_discovery(db, instant)
@@ -724,7 +797,7 @@ class Studio:
             per_author = {}
             for row in sorted(rows, key=lambda item: (item["popularity"], item["observed"]), reverse=True):
                 author, key = row["author"], row["key"]
-                if not directory_mode() and key not in known_keys and (
+                if not directory and key not in known_keys and (
                         author not in eligible or per_author.get(author, 0) >= 2):
                     continue
                 per_author[author] = per_author.get(author, 0) + 1
@@ -736,7 +809,7 @@ class Studio:
             db.execute("""UPDATE sources SET status='expired' WHERE status='waiting' AND last_seen IS NOT NULL
                           AND (last_seen < ? OR (kind='live' AND last_seen < ?))""",
                        (iso(instant - discovery.WINDOW), iso(instant - timedelta(hours=6))))
-            if directory_mode():
+            if directory:
                 if updates:
                     current_keys = {row["key"] for _, _, items in updates for row in items}
                     stale = [row["id"] for row in db.execute("""SELECT id,source_key FROM sources
@@ -861,10 +934,12 @@ class Studio:
                            (str(error)[:650], source["id"]))
 
     def populate(self, db):
+        allowed = youtube_auto_broadcasters()
         choices = {}
         accounts = db.execute("""SELECT c.id AS clip_id, c.lang, c.verified, a.id AS account_id,
-            a.auto, a.platform, a.refresh_token IS NOT NULL AS connected, h.state AS route_state
+            a.auto, a.platform, a.refresh_token IS NOT NULL AS connected, h.state AS route_state, s.twitch_broadcaster
             FROM clips c JOIN accounts a ON a.lang=c.lang
+            LEFT JOIN sources s ON s.id=c.source_id
             LEFT JOIN route_health h ON h.route=a.route AND h.platform=a.platform
             WHERE NOT EXISTS (SELECT 1 FROM queue q JOIN accounts existing ON existing.id=q.account_id
                                WHERE q.clip_id=c.id AND existing.platform=a.platform)
@@ -876,14 +951,15 @@ class Studio:
             ranked = []
             for account in options:
                 automatic = (platform == "YouTube" and account["lang"] == "RU" and account["auto"] and account["connected"]
-                             and account["verified"] and self.uploads_enabled())
+                             and account["verified"] and self.uploads_enabled()
+                             and (allowed is None or account["twitch_broadcaster"] in allowed))
                 slot = self.next_slot(db, account["account_id"], account["lang"], instant)
                 on_hold = account["route_state"] in ("failed", "unconfigured")
                 ranked.append((not automatic, on_hold if automatic else False, slot, account["account_id"]))
             review, held, slot, account_id = min(ranked)
             state = "review" if review else ("route_wait" if held else "scheduled")
-            db.execute("INSERT INTO queue(clip_id,account_id,at,status) VALUES (?,?,?,?)",
-                       (clip_id, account_id, slot, state))
+            db.execute("INSERT INTO queue(clip_id,account_id,at,status,auto_scheduled) VALUES (?,?,?,?,?)",
+                       (clip_id, account_id, slot, state, None if review else 1))
 
     @staticmethod
     def next_slot(db, account, lang, after, exclude=None):
@@ -930,7 +1006,9 @@ class Studio:
                 state = job["status"] if job["status"] in ("scheduled", "route_wait") else "review"
             else:
                 raise ValueError("Неизвестное действие.")
-            db.execute("UPDATE queue SET at=?,status=?,detail='',retry_at=NULL WHERE id=?", (iso(planned), state, identifier))
+            automatic = 0 if action == "send" else job["auto_scheduled"]
+            db.execute("UPDATE queue SET at=?,status=?,detail='',retry_at=NULL,auto_scheduled=? WHERE id=?",
+                       (iso(planned), state, automatic, identifier))
 
     @staticmethod
     def connection_snapshot(rows):
@@ -1133,6 +1211,11 @@ class Studio:
             db.execute("BEGIN IMMEDIATE")
             if db.execute("SELECT value FROM settings WHERE name='paused'").fetchone()[0]:
                 return
+            allowed = youtube_auto_broadcasters()
+            if allowed is not None:
+                self.hold_unapproved_youtube_uploads(db, allowed)
+                if allowed:
+                    self.promote_automatic_youtube(db, allowed)
             job = db.execute("""SELECT q.id,q.account_id,q.at,c.title,c.lang,c.relative_path,c.description,c.hashtags
                                 FROM queue q JOIN clips c ON c.id=q.clip_id JOIN accounts a ON a.id=q.account_id
                                 WHERE q.status='scheduled' AND q.external_id IS NULL AND a.platform='YouTube'
@@ -1214,6 +1297,30 @@ class Studio:
         except transport.ConnectionProblem:
             return
         self.apply_youtube_status(dict(id=job["id"],status="remote_check"), video, now())
+
+    @staticmethod
+    def promote_automatic_youtube(db, allowed, account_id=None):
+        pending = db.execute("""SELECT q.id,s.twitch_broadcaster
+            FROM queue q JOIN clips c ON c.id=q.clip_id JOIN accounts a ON a.id=q.account_id
+            LEFT JOIN sources s ON s.id=c.source_id
+            WHERE a.auto=1 AND a.platform='YouTube' AND a.lang='RU' AND a.refresh_token IS NOT NULL
+            AND q.account_id=COALESCE(?,q.account_id) AND q.status='review'
+            AND q.external_id IS NULL AND c.verified=1""", (account_id,)).fetchall()
+        db.executemany("""UPDATE queue SET status='scheduled',detail='',retry_at=NULL,auto_scheduled=1
+            WHERE id=?""", [(job["id"],) for job in pending
+                            if allowed is None or job["twitch_broadcaster"] in allowed])
+
+    @staticmethod
+    def hold_unapproved_youtube_uploads(db, allowed):
+        # NULL applies the new source check to legacy jobs with no record of manual approval.
+        pending = db.execute("""SELECT q.id,s.twitch_broadcaster FROM queue q
+            JOIN clips c ON c.id=q.clip_id JOIN accounts a ON a.id=q.account_id
+            LEFT JOIN sources s ON s.id=c.source_id
+            WHERE a.platform='YouTube' AND a.lang='RU' AND q.status IN ('scheduled','route_wait')
+            AND q.external_id IS NULL AND q.auto_scheduled IS NOT 0""").fetchall()
+        db.executemany("""UPDATE queue SET status='review',retry_at=NULL,
+            detail='Для автоотправки нужен разрешённый источник Twitch.' WHERE id=?""",
+            [(job["id"],) for job in pending if job["twitch_broadcaster"] not in allowed])
 
     def loop(self, operation, interval):
         while not self.stop.is_set():
