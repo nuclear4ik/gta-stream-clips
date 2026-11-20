@@ -45,8 +45,9 @@ RU_INVENTORY_LIMIT = 30
 AUTO_RENDER_BATCH = 3
 MIN_SPEECH_CONFIDENCE = 0.90
 PUBLISH_LEAD = timedelta(minutes=15)
-TWITCH_DISCOVERY_INTERVAL = timedelta(minutes=30)
+TWITCH_MEDIA_RETRY = timedelta(minutes=30)
 TWITCH_MEDIA_ATTEMPTS = 5
+RU_PREFETCH_LIMIT = 3
 RESERVING_QUEUE_STATES = ("scheduled", "route_wait", "checking", "sending", "unknown",
                           "remote_check", "preloaded", "uploaded")
 TWITCH_FILE_PENDING = "Автоматическое получение пока не вернуло файл. Сервис проверит запись снова."
@@ -719,10 +720,12 @@ class Studio:
             handled = {(row["lang"], row["url"]) for row in db.execute(
                 """SELECT lang,url FROM sources
                    WHERE kind IN ('vod','video') AND (rel_file IS NOT NULL OR status NOT IN ('waiting','expired'))""")} if strict else set()
-            pending_langs = {row["lang"] for row in db.execute("""SELECT DISTINCT lang FROM sources
-                WHERE rel_file IS NOT NULL AND status='queued' AND auto_plan IS NULL""")}
+            pending_by_lang = dict(db.execute("""SELECT lang,count(*) FROM sources
+                WHERE rel_file IS NOT NULL AND status='queued' AND auto_plan IS NULL GROUP BY lang"""))
+        prefetch_limit = RU_PREFETCH_LIMIT if strict else 1
         for lang, (_, rows) in ranked.items():
-            if not automatic_editing(lang) or self.inventory_capacity(counts, lang) <= 0 or lang in pending_langs:
+            if (not automatic_editing(lang) or self.inventory_capacity(counts, lang) <= 0
+                    or pending_by_lang.get(lang, 0) >= prefetch_limit):
                 continue
             candidates = sorted(rows, key=lambda item: (
                 item.get("directory_priority", float("inf")), item.get("directory_rank", float("inf")),
@@ -746,7 +749,7 @@ class Studio:
                 if destination.exists() or destination.is_symlink():
                     continue
                 attempts += 1
-                self.media_checks[url] = instant + TWITCH_DISCOVERY_INTERVAL
+                self.media_checks[url] = instant + TWITCH_MEDIA_RETRY
                 try:
                     received = twitch_media.fetch(item, destination, current=instant)
                     detail = "" if received is not None else TWITCH_FILE_PENDING
@@ -813,6 +816,14 @@ class Studio:
         finally:
             self.search_lock.release()
 
+    def twitch_needs_sources(self, db):
+        if not automatic_editing("RU") or not self.inventory_capacity(self.ready_counts(db), "RU"):
+            return False
+        pending = db.execute("""SELECT rel_file FROM sources
+            WHERE lang='RU' AND rel_file IS NOT NULL AND
+                  (status='editing' OR status='queued' AND edit_profile IS NULL)""")
+        return not any((self.input / "RU" / row["rel_file"]).is_file() for row in pending)
+
     def search_cycle(self, force, live_only):
         instant = now()
         checked = iso(instant)
@@ -827,8 +838,11 @@ class Studio:
             retry = directory and db.execute("SELECT started_at FROM discovery_runs WHERE name=?",
                                              (retry_name,)).fetchone()
             previous = retry or db.execute("SELECT started_at FROM discovery_runs WHERE name=?", (run_name,)).fetchone()
-            interval = timedelta(minutes=5) if retry else (
-                TWITCH_DISCOVERY_INTERVAL if directory else timedelta(seconds=regional.REGIONAL_INTERVAL))
+            rapid = strict and self.twitch_needs_sources(db)
+            if directory:
+                interval = (twitch_directory.RAPID_POLL_INTERVAL if retry or rapid else twitch_directory.POLL_INTERVAL)
+            else:
+                interval = timedelta(seconds=regional.REGIONAL_INTERVAL)
             if not force and previous and datetime.fromisoformat(previous[0]) + interval > instant:
                 return
             if not directory and not live_only:
@@ -851,7 +865,8 @@ class Studio:
         updates, errors = [], []
         if directory:
             try:
-                twitch = twitch_directory.search(LANGS, instant, known_live=past_live, previous=previous_selection)
+                twitch = twitch_directory.search(LANGS, instant, known_live=past_live, previous=previous_selection,
+                                                 rapid=rapid)
                 updates.extend((lang, "Twitch", rows) for lang, rows in (twitch or {}).items())
             except transport.ConnectionProblem as error:
                 with self.db() as db:
@@ -921,7 +936,9 @@ class Studio:
                     db.execute("""UPDATE sources SET status='expired' WHERE id IN (
                         SELECT id FROM sources WHERE lang=? AND status='waiting' AND last_seen IS NOT NULL
                         ORDER BY last_seen DESC,id DESC LIMIT -1 OFFSET 30)""", (lang,))
-        cadence = "проверка каждые 30 минут" if directory else "проверка раз в 5 часов"
+        cadence = "проверка раз в 5 часов"
+        if directory:
+            cadence = f"проверка каждые {interval // timedelta(minutes=1)} минут"
         description = "Каталог Twitch обновлён" if strict else f"Новые источники: {saved}"
         self.search_status = " · ".join(errors) if errors else f"{description} · {cadence}"
 
@@ -1834,7 +1851,7 @@ def main():
             Thread(target=studio.loop, args=(studio.publish_one, 8), daemon=True).start()
             Thread(target=studio.loop, args=(studio.sync_youtube, 180), daemon=True).start()
             Thread(target=studio.loop, args=(studio.search, 60), daemon=True).start()
-            Thread(target=studio.loop, args=(studio.fetch_twitch_media, 60), daemon=True).start()
+            Thread(target=studio.loop, args=(studio.fetch_twitch_media, 20), daemon=True).start()
             Thread(target=studio.loop, args=(studio.monitor_connections, 60), daemon=True).start()
             Thread(target=studio.loop, args=(studio.refresh_metrics, 60), daemon=True).start()
             print(f"Streamcut: http://127.0.0.1:{server.server_port}/", flush=True)

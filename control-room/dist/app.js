@@ -275,7 +275,7 @@
       <section class="surface">
         <div class="bar"><div><strong>Автопоиск</strong>
           <small>${escape(data.search_status || (!data.live || data.search_configured
-            ? 'Twitch · проверка каждые 30 минут'
+            ? 'Twitch · фоновый поиск'
             : 'Для поиска по категории нужны параметры API Twitch.'))}</small></div>
           ${data.live ? '<button class="quiet" data-do="scan" aria-pressed="' + data.settings.scan + '">' + (data.settings.scan ? 'Включён' : 'Выключен') + '</button>' : '<span class="status scheduled">Включён по умолчанию</span>'}</div>
         <div class="source-roster"><strong>${badge(sourcesLanguage)} ${countries[markets[sourcesLanguage].country]}</strong>

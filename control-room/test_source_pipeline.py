@@ -178,6 +178,7 @@ class SourcePipelineTests(unittest.TestCase):
                 with patch("studio.now", return_value=clock):
                     service.search()
             self.assertEqual(directory.call_count, 2)
+            self.assertTrue(all(not call.kwargs["rapid"] for call in directory.call_args_list))
             state = service.snapshot()
             self.assertEqual(state["source_health"], {"archives": 1, "clips": 0, "accessible": 0, "active": 0})
             self.assertEqual(state["inventory_limit"], 30)
@@ -194,7 +195,7 @@ class SourcePipelineTests(unittest.TestCase):
             self.assertEqual(state["source_health"], {"archives": 0, "clips": 0, "accessible": 0, "active": 1})
             self.assertEqual([item["status"] for item in state["sources"]], ["queued"])
 
-    def test_directory_checks_every_30_minutes_and_registers_only_successful_downloads(self):
+    def test_empty_production_scans_every_five_minutes_and_only_registers_downloads(self):
         service = self.service()
         instant = studio.now().replace(microsecond=0)
         candidate = dict(lang="RU", kind="vod", url="https://www.twitch.tv/videos/125", twitch_user="11",
@@ -206,10 +207,11 @@ class SourcePipelineTests(unittest.TestCase):
         with patch.dict(os.environ, settings, clear=True), patch("twitch_directory.search", return_value={
             "RU": [candidate], "EN": [], "ESP": [],
         }) as directory:
-            for elapsed, expected in ((0, 1), (29, 1), (30, 2)):
+            for elapsed, expected in ((0, 1), (4, 1), (5, 2), (9, 2), (10, 3)):
                 with patch("studio.now", return_value=instant + studio.timedelta(minutes=elapsed)):
                     service.search()
                 self.assertEqual(directory.call_count, expected)
+            self.assertTrue(all(call.kwargs["rapid"] for call in directory.call_args_list))
             with patch("studio.automatic_editing", return_value=True), patch(
                     "twitch_media.configured", return_value=True), patch("twitch_media.fetch", return_value=None) as fetch:
                 service.fetch_twitch_media()
@@ -227,6 +229,38 @@ class SourcePipelineTests(unittest.TestCase):
                 fetch.side_effect = download
                 service.fetch_twitch_media()
             self.assertEqual([row["status"] for row in service.snapshot()["sources"]], ["queued"])
+
+    def test_ru_acquisition_prefetches_three_distinct_files_and_refills_after_claim(self):
+        service = self.service()
+        observed = studio.iso(studio.now())
+        candidates = [
+            dict(lang="RU", kind="video", url=f"https://clips.twitch.tv/Clip{i}", twitch_user="11",
+                 title=f"GTA VI Clip {i}", creator="Автор", author="11", directory_followup=True,
+                 key=f"twitch:clip:Clip{i}", clip_id=f"Clip{i}", observed=observed, popularity=10 - i,
+                 provider="Twitch") for i in range(4)
+        ]
+        settings = {"STREAMCUT_TWITCH_STRICT_RU": "1", "TWITCH_CLIENT_ID": "id", "TWITCH_CLIENT_SECRET": "secret"}
+
+        def download(candidate, destination, *, current):
+            destination.write_text(candidate["clip_id"])
+            return destination
+
+        with patch.dict(os.environ, settings, clear=True), patch("twitch_directory.search", return_value={
+                "RU": candidates, "EN": [], "ESP": [],
+        }) as directory, patch("twitch_media.configured", return_value=True), patch(
+                "twitch_media.fetch", side_effect=download) as fetch:
+            service.search(force=True)
+            for _ in candidates:
+                service.fetch_twitch_media()
+            self.assertEqual(fetch.call_count, 3)
+            with patch("studio.now", return_value=studio.datetime.fromisoformat(observed) + studio.timedelta(minutes=5)):
+                service.search()
+            directory.assert_called_once()
+            with service.db() as db:
+                db.execute("UPDATE sources SET status='editing' WHERE source_key='twitch:clip:Clip0'")
+            service.fetch_twitch_media()
+            self.assertEqual([call.args[0]["clip_id"] for call in fetch.call_args_list],
+                             ["Clip0", "Clip1", "Clip2", "Clip3"])
 
     def test_strict_media_skips_watch_only_and_denied_items_then_queues_the_available_clip(self):
         service = self.service()

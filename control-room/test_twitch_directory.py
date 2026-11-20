@@ -281,6 +281,37 @@ class TwitchDirectoryTests(unittest.TestCase):
         self.assertEqual(recording_queries[3], recording_queries[0])
         self.assertNotEqual(recording_queries[4][:2], recording_queries[1][:2])
 
+    def test_rapid_ru_polls_rotate_archive_variants_and_channels_every_five_minutes(self):
+        current = datetime(2026, 11, 20, 8, tzinfo=timezone.utc)
+        env = SECRETS | {twitch_directory.STRICT_RU: "1"}
+        orders = []
+        checked_users = []
+
+        def page(endpoint, params, _headers, _action):
+            if endpoint == "streams":
+                return paged([live(user, "ru", 50 - user) for user in range(1, 35)])
+            options = dict(params)
+            if "game_id" in options and options["sort"] != "time":
+                orders.append((options["sort"], options["period"]))
+            return paged([])
+
+        def records(user, _code, _headers):
+            checked_users[-1].append(user)
+            return []
+
+        with patch.dict(os.environ, env, clear=True), patch("discovery.twitch_headers", return_value={}), patch(
+                "twitch_directory.category_id", return_value=GAME), patch(
+                "twitch_directory.archive_rows", side_effect=records), patch(
+                "twitch_clips.helix_page", side_effect=page), patch("twitch_clips.search", return_value=[]):
+            for minute in range(0, 20, 5):
+                checked_users.append([])
+                twitch_directory.search(LANGUAGES, current + timedelta(minutes=minute), rapid=True)
+
+        self.assertEqual(set(orders), set(twitch_directory.ARCHIVE_ORDERS))
+        first, second = checked_users[:2]
+        self.assertEqual(first[:10], second[:10])
+        self.assertNotEqual(set(first[10:]), set(second[10:]))
+
     def test_directory_pagination_uses_helix_response_data_and_cursor(self):
         responses = [paged([{"id": "1"}], "next+page"), paged([{"id": "2"}])]
         with patch("discovery.request", side_effect=[

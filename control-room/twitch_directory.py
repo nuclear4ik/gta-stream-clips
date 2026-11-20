@@ -17,7 +17,8 @@ UNRANKED_ARCHIVE_CHANNELS = 8
 ALTERNATE_ARCHIVE_CHANNELS = 6
 RECENT_CLIP_LIMIT = 300
 ARCHIVE_ORDERS = (("views", "day"), ("trending", "week"), ("views", "week"), ("trending", "day"))
-DIRECTORY_INTERVAL_SECONDS = 30 * 60
+POLL_INTERVAL = timedelta(minutes=30)
+RAPID_POLL_INTERVAL = timedelta(minutes=5)
 DIRECTORY_CURSOR_TTL = timedelta(hours=2)
 RECHECK_ARCHIVES = 100
 RECHECK_STREAMS = 30
@@ -159,8 +160,8 @@ def archive_rows(user, code, headers):
                             headers, "Записи выбранного канала Twitch")
 
 
-def rotation(current):
-    return int(current.timestamp()) // DIRECTORY_INTERVAL_SECONDS
+def rotation(current, interval=POLL_INTERVAL):
+    return int(current.timestamp() // interval.total_seconds())
 
 
 def rotating_subset(items, turn, limit):
@@ -170,8 +171,7 @@ def rotating_subset(items, turn, limit):
     return (items + items)[start:start + limit]
 
 
-def alternate_channel_archives(channels, code, headers, current, known_live):
-    turn = rotation(current)
+def alternate_channel_archives(channels, code, headers, current, known_live, turn):
     sort, period = ARCHIVE_ORDERS[turn % len(ARCHIVE_ORDERS)]
     for channel in rotating_subset(channels, turn, ALTERNATE_ARCHIVE_CHANNELS):
         try:
@@ -245,8 +245,8 @@ def optional_ru_channels(headers):
         return {}
 
 
-def category_archives(game_id, code, headers, current):
-    orders = (("time", "week"), ARCHIVE_ORDERS[rotation(current) % len(ARCHIVE_ORDERS)])
+def category_archives(game_id, code, headers, current, turn):
+    orders = (("time", "week"), ARCHIVE_ORDERS[turn % len(ARCHIVE_ORDERS)])
     for sort, period in orders:
         try:
             rows = directory_pages(
@@ -323,7 +323,7 @@ def follow_archives(selected, previous, code, archives, headers, current, *, ver
             seen.add((key, "live"))
 
 
-def search(languages, current, *, known_live=(), previous=None):
+def search(languages, current, *, known_live=(), previous=None, rapid=False):
     """Keep the display ranking separate from the broader search for material."""
     client = os.environ.get("TWITCH_CLIENT_ID")
     secret = os.environ.get("TWITCH_CLIENT_SECRET")
@@ -335,6 +335,7 @@ def search(languages, current, *, known_live=(), previous=None):
         return results
     headers = discovery.twitch_headers(client, secret)
     game_id = category_id(headers, aliases=strict)
+    turn = rotation(current, RAPID_POLL_INTERVAL if rapid else POLL_INTERVAL)
     known_live = set(known_live)
     previous = previous or {}
     for lang, code in ({"RU": "ru"} if strict else languages).items():
@@ -344,7 +345,7 @@ def search(languages, current, *, known_live=(), previous=None):
                                 previous_cursor=cached_stream_cursor(entries, lang, game_id, current) if strict else None)
         current_channels = {stream["twitch_user"]: stream for stream in active}
         archive_channels = (active[:TOP_CHANNELS] + rotating_subset(
-            active[TOP_CHANNELS:], rotation(current), UNRANKED_ARCHIVE_CHANNELS) if strict else active)
+            active[TOP_CHANNELS:], turn, UNRANKED_ARCHIVE_CHANNELS) if strict else active)
         for stream in archive_channels:
             selected.append(stream)
             user = stream["twitch_user"]
@@ -371,8 +372,8 @@ def search(languages, current, *, known_live=(), previous=None):
             additional = [followed_channels.get(user) or dict(twitch_user=user, twitch_login=login,
                           lang="RU", game_id=game_id) for user, login in followed.items()]
             additional.extend(stream for stream in archive_channels if stream["twitch_user"] not in followed)
-            selected.extend(alternate_channel_archives(additional, code, headers, current, known_live))
-            selected.extend(category_archives(game_id, code, headers, current))
+            selected.extend(alternate_channel_archives(additional, code, headers, current, known_live, turn))
+            selected.extend(category_archives(game_id, code, headers, current, turn))
         retained = list(previous_selection(entries, lang, game_id, current))
         if strict:
             clips = {item["clip_id"]: item for item in retained if item["kind"] == "video" and item.get("clip_id")}
