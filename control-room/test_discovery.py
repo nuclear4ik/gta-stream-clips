@@ -10,6 +10,7 @@ from unittest.mock import patch
 from urllib.parse import parse_qs, urlsplit
 
 import discovery
+import regional
 import studio
 
 
@@ -17,16 +18,16 @@ def reply(data):
     return 200, {}, json.dumps(data).encode()
 
 
-def youtube_item(video, title, channel, broadcast="none", description=""):
-    return {
-        "id": {"kind": "youtube#video", "videoId": video},
-        "snippet": {"title": title, "channelTitle": channel, "description": description,
-                    "liveBroadcastContent": broadcast},
-    }
-
-
 class YouTubeDiscoveryTest(unittest.TestCase):
     def test_originals_reuploads_and_false_matches_in_each_market(self):
+        current = datetime(2026, 11, 19, 9, tzinfo=timezone.utc)
+
+        def youtube_item(video, title, channel, broadcast="none", description=""):
+            return {"id": video, "snippet": {
+                "title": title, "channelTitle": channel, "description": description, "channelId": "UC" + "Z" * 22,
+                "publishedAt": studio.iso(current - timedelta(hours=1)), "liveBroadcastContent": broadcast,
+            }}
+
         markets = [
             ("RU", "ru", "RU", "Бустер,Buster", "Buster", "Бустер &amp; друзья", "ГТА‑VI",
              "Супербустер", "ГТА 5", "Подпишитесь на Бустера"),
@@ -51,33 +52,48 @@ class YouTubeDiscoveryTest(unittest.TestCase):
                     youtube_item("jjjjjjjjjjj", game, alias, "upcoming"),
                     youtube_item("invalid", game, alias),
                 ]
-                env = {"STREAMCUT_YOUTUBE_KEY": "fixture", f"STREAMCUT_YOUTUBE_{lang}": f"{names}|{alias}"}
+                details = {item["id"]: item for item in items}
+
+                def response(_route, host, method, path, _headers):
+                    self.assertEqual((host, method), ("www.googleapis.com", "GET"))
+                    endpoint = urlsplit(path)
+                    query = parse_qs(endpoint.query)
+                    if endpoint.path == "/youtube/v3/search":
+                        self.assertEqual(query["regionCode"], [region])
+                        self.assertEqual(query["relevanceLanguage"], [code])
+                        return reply({"items": [{"id": {"videoId": item["id"]}} for item in items]})
+                    self.assertEqual(endpoint.path, "/youtube/v3/videos")
+                    identifiers = query["id"][0].split(",")
+                    self.assertEqual(len(identifiers), len(set(identifiers)))
+                    self.assertNotIn("invalid", identifiers)
+                    return reply({"items": [details[identifier] for identifier in identifiers]})
+
+                env = {"STREAMCUT_YOUTUBE_KEY": "fixture", f"STREAMCUT_YOUTUBE_{lang}": names}
                 with patch.dict(os.environ, env, clear=True), patch.object(
-                        discovery, "request", return_value=reply({"items": items})) as request:
-                    candidates = list(discovery.youtube(lang, code))
-                self.assertEqual(candidates, [
-                    {"lang": lang, "title": game, "kind": "live", "url": "https://www.youtube.com/watch?v=aaaaaaaaaaa"},
-                    {"lang": lang, "title": reupload["snippet"]["title"].replace("&amp;", "&"), "kind": "video",
-                     "url": "https://www.youtube.com/watch?v=bbbbbbbbbbb"},
+                        discovery, "request", side_effect=response) as request:
+                    candidates = regional.youtube_market(lang, code, current)
+                self.assertEqual([(row["lang"], row["title"], row["kind"], row["url"]) for row in candidates], [
+                    (lang, game, "live", "https://www.youtube.com/watch?v=aaaaaaaaaaa"),
+                    (lang, reupload["snippet"]["title"].replace("&amp;", "&"), "video",
+                     "https://www.youtube.com/watch?v=bbbbbbbbbbb"),
                 ])
-                self.assertEqual(request.call_count, 2)
-                args = request.call_args_list[0].args
-                self.assertEqual(args[1:3], ("www.googleapis.com", "GET"))
-                query = parse_qs(urlsplit(args[3]).query)
-                self.assertEqual(query["regionCode"], [region])
-                self.assertEqual(query["relevanceLanguage"], [code])
-                self.assertIn(f"Grand Theft Auto VI {alias}", query["q"][0].split("|"))
+                queries = [parse_qs(urlsplit(call.args[3]).query) for call in request.call_args_list
+                           if urlsplit(call.args[3]).path == "/youtube/v3/search"]
+                self.assertIn("Grand Theft Auto VI", queries[0]["q"][0].split("|"))
+                self.assertEqual(queries[0]["eventType"], ["live"])
+                self.assertTrue(any(f"GTA 6 {alias}" in query["q"][0].split("|") for query in queries[1:]))
                 if lang == "RU":
-                    self.assertIn(f"ГТА VI {alias}", query["q"][0].split("|"))
+                    self.assertIn("ГТА VI", queries[0]["q"][0].split("|"))
 
     def test_default_roster_and_missing_api_keys(self):
         with patch.dict(os.environ, {}, clear=True), patch.object(discovery, "request") as request:
-            self.assertFalse(discovery.configured())
+            self.assertFalse(regional.configured())
             self.assertIn("Бустер", discovery.roster()["RU"])
             self.assertIn("Kai Cenat", discovery.roster()["EN"])
             self.assertIn("IlloJuan", discovery.roster()["ESP"])
-            self.assertEqual(list(discovery.youtube("EN", "en")), [])
-            self.assertEqual(list(discovery.twitch({"ESP": "es"})), [])
+            current = studio.now()
+            self.assertIsNone(regional.youtube_market("EN", "en", current))
+            self.assertIsNone(regional.twitch_markets({"ESP": "es"}, current, set()))
             request.assert_not_called()
 
     def test_overrides_support_alias_groups_and_empty_platform_lists(self):
@@ -103,6 +119,7 @@ def twitch_archive(video, stream, user, code, title, age=timedelta(hours=1)):
 class TwitchDiscoveryTest(unittest.TestCase):
     def setUp(self):
         self.env = {"TWITCH_CLIENT_ID": "fixture-client", "TWITCH_CLIENT_SECRET": "fixture-secret",
+                    "STREAMCUT_DISCOVERY_MODE": "regional",
                     "STREAMCUT_TWITCH_RU": " @Fixture_RU ", "STREAMCUT_TWITCH_EN": "22",
                     "STREAMCUT_TWITCH_ESP": "fixture_es"}
         self.users = [{"id": "11", "login": "fixture_ru"}, {"id": "22", "login": "fixture_en"},
@@ -144,7 +161,9 @@ class TwitchDiscoveryTest(unittest.TestCase):
                 return reply({"data": streams, "pagination": {}})
             self.assertEqual(endpoint.path, "/helix/videos")
             self.assertEqual(query["type"], ["archive"])
-            return reply({"data": vods_by_user[query["user_id"][0]], "pagination": {}})
+            archives = vods_by_user[query["user_id"][0]]
+            self.assertEqual(query["language"], [archives[0]["language"]])
+            return reply({"data": archives, "pagination": {}})
 
         directory = self.enterContext(TemporaryDirectory())
         with patch.dict(os.environ, self.env, clear=True), patch.object(
@@ -183,15 +202,26 @@ class TwitchDiscoveryTest(unittest.TestCase):
             {**item, "id": "208", "stream_id": "108", "title": "GTA V | tags: GTA6"},
             twitch_archive("209", "109", "22", "en", "GTA VI", age=timedelta(days=10)),
         ]
-        responses = [reply({"access_token": "fixture-token"}), reply({"data": [self.users[1]]}),
-                     reply({"data": archives, "pagination": {}})]
+        def response(_route, host, _method, path, _headers, *_args):
+            if host == "id.twitch.tv":
+                return reply({"access_token": "fixture-token"})
+            endpoint = urlsplit(path)
+            if endpoint.path == "/helix/users":
+                return reply({"data": [self.users[1]]})
+            if endpoint.path in {"/helix/games", "/helix/streams"}:
+                return reply({"data": []})
+            self.assertEqual(endpoint.path, "/helix/videos")
+            self.assertEqual(parse_qs(endpoint.query)["user_id"], ["22"])
+            return reply({"data": archives})
+
+        current = studio.now()
         with patch.dict(os.environ, self.env, clear=True), patch.object(
-                discovery, "request", side_effect=responses):
-            candidates = list(discovery.twitch({"EN": "en"}))
-        self.assertEqual(candidates, [
-            {"lang": "EN", "title": item["title"], "url": "https://www.twitch.tv/videos/201",
-             "kind": "vod", "key": "twitch:stream:101"},
-            {"lang": "EN", "title": item["title"], "url": "https://www.twitch.tv/videos/203", "kind": "vod"},
+                discovery, "request", side_effect=response):
+            candidates = regional.current_candidates(
+                regional.twitch_markets({"EN": "en"}, current, set())["EN"], current)
+        self.assertEqual([(row["lang"], row["url"], row["kind"], row["key"]) for row in candidates], [
+            ("EN", "https://www.twitch.tv/videos/201", "vod", "twitch:stream:101"),
+            ("EN", "https://www.twitch.tv/videos/203", "vod", "twitch:vod:203"),
         ])
 
 

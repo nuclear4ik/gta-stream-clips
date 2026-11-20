@@ -4,6 +4,8 @@
   const languages = {RU: 'Русский', EN: 'English', ESP: 'Español'};
   const platforms = ['YouTube', 'TikTok', 'Reels'];
   const countries = {RU: 'Россия', US: 'США', ES: 'Испания', server: 'Прямой маршрут'};
+  const routes = {...countries, gateway: 'Доверенный шлюз'};
+  const sourcesLanguage = 'RU';
   const markets = {
     RU: {country: 'RU', city: 'Москва', zone: 'Europe/Moscow'},
     EN: {country: 'US', city: 'Нью-Йорк', zone: 'America/New_York'},
@@ -17,9 +19,15 @@
   const maxTranscriptBytes = 512 * 1024;
   const labels = {
     waiting: 'Нужен исходный файл', waiting_layout: 'Нужны границы камеры', queued: 'В работе', editing: 'Монтируется', ready: 'Готово',
-    empty: 'Моменты не найдены', failed: 'Ошибка монтажа', review: 'На проверку', scheduled: 'Запланировано',
-    checking: 'Проверка маршрута', sending: 'Отправляется', blocked: 'Заблокировано', unknown: 'Проверьте Studio',
-    uploaded: 'Загружено · приватно', cancelled: 'Отменено', route_wait: 'Ждёт подключения',
+    twitch_wait_archive: 'Ожидает архив Twitch', twitch_wait_check: 'Ожидает проверки записи',
+    twitch_wait_access: 'Нужен доступ к исходнику', twitch_wait_media: 'Ожидает автополучения',
+    twitch_media_missing: 'Файл пока недоступен', twitch_media_error: 'Ошибка автополучения',
+    twitch_paused: 'Автополучение отложено',
+    empty: 'Моменты не найдены', failed: 'Ошибка монтажа', review: 'Готов к планированию',
+    scheduled: 'Ждёт слота YouTube', preloaded: 'Запланировано в YouTube',
+    checking: 'Проверка подключения', sending: 'Загружается в YouTube', remote_check: 'YouTube проверяет расписание',
+    blocked: 'Заблокировано', unknown: 'Проверьте Studio',
+    uploaded: 'Опубликовано', cancelled: 'Отменено', route_wait: 'Ждёт подключения',
   };
   const healthLabels = {
     ok: 'Доступно', failed: 'Сбой', unconfigured: 'Не настроено', unchecked: 'Ожидает проверки',
@@ -53,8 +61,8 @@
     live: false, settings: {scan: true, paused: false}, accounts: [], sources: [],
     queue: [
       {id: 1, title: 'Погоня после прыжка', lang: 'RU', platform: 'YouTube', status: 'review'},
-      {id: 2, title: 'The getaway went wrong', lang: 'EN', platform: 'YouTube', status: 'scheduled'},
-      {id: 3, title: 'La primera reacción', lang: 'ESP', platform: 'Reels', status: 'review'},
+      {id: 2, title: 'Слишком ранний поворот', lang: 'RU', platform: 'YouTube', status: 'preloaded'},
+      {id: 3, title: 'La primera reacción', lang: 'ESP', platform: 'YouTube', status: 'scheduled'},
     ].map((job, i) => ({...job, clip_id: job.id, account: defaults[job.lang],
       at: new Date(Date.now() + (i + 1) * 3600000).toISOString()})),
   };
@@ -124,65 +132,123 @@
   const option = (value, name, selected) =>
     '<option value="' + escape(value) + '"' + (value === selected ? ' selected' : '') + '>' + escape(name) + '</option>';
 
-  function queueRows(jobs) {
-    if (!jobs.length) {
-      return '<div class="blank"><strong>Очередь пуста</strong><p>Готовые клипы появятся здесь после монтажа и добавления аккаунта.</p><a href="#sources">Открыть источники →</a></div>';
-    }
-    return '<div class="job-list">' + jobs.map(job => {
-      const canEdit = !['sending', 'checking', 'unknown', 'uploaded', 'cancelled'].includes(job.status);
+  function jobAccount(job) {
+    if (job.account_id != null) return data.accounts.find(account => account.id === job.account_id);
+    return data.accounts.find(account => account.name === job.account &&
+      account.platform === job.platform && account.lang === job.lang);
+  }
+
+  function jobTime(job) {
+    return job.status === 'preloaded' ? job.publish_at || job.at : job.at;
+  }
+
+  function studioLink(job) {
+    return typeof job.external_id === 'string' && /^[A-Za-z0-9_-]{11}$/.test(job.external_id)
+      ? '<a href="https://studio.youtube.com/video/' + job.external_id +
+        '/edit" target="_blank" rel="noopener noreferrer">YouTube Studio ↗</a>' : '';
+  }
+
+  function queueRows(jobs, clips = []) {
+    const rows = jobs.map(job => {
+      const canEdit = job.status === 'preloaded' || !job.external_id &&
+        !['sending', 'checking', 'remote_check', 'unknown', 'uploaded', 'cancelled'].includes(job.status);
+      const at = jobTime(job);
       return `<article class="job">
-        <div class="job-time"><time datetime="${escape(job.at)}">${escape(time(job.at, job.lang))}</time>
-          <small>${markets[job.lang].city}</small></div>
+        <div class="job-time">${Number.isFinite(Date.parse(at))
+          ? '<time datetime="' + escape(at) + '">' + escape(time(at, job.lang)) + '</time>'
+          : 'Время не задано'}
+          <small>${markets[job.lang].city}${job.status === 'preloaded' ? '' : ' · локальное время'}</small></div>
         <div class="job-title">${badge(job.lang)}<div><strong>${escape(job.title)}</strong>
           <small>${escape(platformName(job.platform))} · ${escape(job.account)}</small>
-          ${job.detail ? '<small class="error-note">' + escape(job.detail) + '</small>' : ''}</div></div>
+          ${job.detail ? '<small class="error-note">' + escape(job.detail) + '</small>' : ''}
+          ${studioLink(job)}</div></div>
         <div class="job-actions">${status(job.status)}
           ${data.live && canEdit ? '<button class="quiet" data-do="edit" data-id="' + job.id + '">Открыть</button>' : ''}
           ${data.live && !canEdit && job.clip_id ? '<button class="quiet" data-do="preview" data-id="' + job.clip_id + '">Видео</button>' : ''}
         </div></article>`;
-    }).join('') + '</div>';
+    });
+    for (const clip of clips) {
+      rows.push(`<article class="job job-ready"><div class="job-title">${badge(clip.lang)}
+        <div><strong>${escape(clip.title)}</strong><small>Готовый MP4</small></div></div>
+        <div class="job-actions">${status('ready')}
+          <button class="quiet" data-do="preview" data-id="${escape(clip.id)}">Видео</button></div></article>`);
+    }
+    return rows.length ? '<div class="job-list">' + rows.join('') + '</div>' : '';
+  }
+
+  function publishingNotice() {
+    if (!data.live) return '';
+    if (!data.oauth) return '<div class="queue-notice">Для планирования нужны настройки Google OAuth на сервере. <a href="#accounts">Аккаунты →</a></div>';
+    const connected = data.accounts.filter(account => account.platform === 'YouTube' && account.lang === 'RU' && account.connected);
+    if (!connected.length) {
+      return '<div class="queue-notice">Подключите Google к каналу RU. Готовые ролики появятся в очереди сразу после монтажа. <a href="#accounts">Аккаунты →</a></div>';
+    }
+    if (!data.uploads) return '<div class="queue-notice">Отправка в YouTube выключена в настройках сервера.</div>';
+    if (data.settings.paused) return '<div class="queue-notice">Новые отправки на паузе. YouTube опубликует уже запланированные ролики по их расписанию.</div>';
+    if (data.youtube_gateway_required && !data.routes?.gateway) {
+      return '<div class="queue-notice">Для отправки в YouTube настройте доверенный шлюз. <a href="#connections">Подключения →</a></div>';
+    }
+    if (data.youtube_gateway_required && !connected.some(account => account.route === 'gateway')) {
+      return '<div class="queue-notice">Выберите доверенный шлюз в настройках канала YouTube RU. <a href="#accounts">Аккаунты →</a></div>';
+    }
+    return '';
   }
 
   function queuePage() {
-    const active = data.queue.filter(job => !['uploaded', 'cancelled'].includes(job.status));
-    const current = job => !filter || job.lang === filter;
-    const assigned = new Set(data.queue.map(job => job.clip_id));
-    const unassigned = data.clips?.filter(clip => current(clip) && !assigned.has(clip.id)) || [];
-    const history = data.queue.filter(job => ['uploaded', 'cancelled'].includes(job.status) && current(job));
+    const jobs = data.queue.filter(job => job.platform === 'YouTube');
+    const current = item => !filter || item.lang === filter;
+    const assigned = new Set(jobs.map(job => job.clip_id));
+    const unassigned = data.clips?.filter(clip => !assigned.has(clip.id)) || [];
+    const finished = ['uploaded', 'cancelled', 'blocked'];
+    const backlog = jobs.filter(job => job.status !== 'preloaded' && !finished.includes(job.status));
+    const scheduled = jobs.filter(job => job.status === 'preloaded' && current(job))
+      .sort((a, b) => Date.parse(jobTime(a)) - Date.parse(jobTime(b)));
+    const history = jobs.filter(job => finished.includes(job.status) && current(job));
+    const waiting = queueRows(backlog.filter(current), unassigned.filter(current));
+    const localLimit = lang => (!data.strict_ru_sources || lang === 'RU') &&
+      Number.isInteger(data.inventory_limit) && data.inventory_limit > 0 ? data.inventory_limit : null;
     const counts = Object.fromEntries(Object.keys(markets).map(lang => [
-      lang, data.queue_counts?.[lang] ?? new Set(active.filter(job => job.lang === lang).map(job => job.clip_id || job.id)).size,
+      lang, data.queue_counts?.[lang] ?? new Set([
+        ...backlog.filter(job => job.lang === lang).map(job => job.clip_id || job.id),
+        ...unassigned.filter(clip => clip.lang === lang).map(clip => clip.id),
+      ]).size,
     ]));
-    return `<div class="heading"><div><h1>Очередь</h1><p>${data.live ? 'Видео к загрузке по аудиториям' : 'Пример очереди'}</p></div>
+    return `<div class="heading"><div><h1>Очередь</h1><p>${data.live ? 'Готовые Shorts и расписание YouTube' : 'Пример очереди'}</p></div>
       ${mainButton('+ Источник', 'source')}</div>
       <div class="market-grid" role="group" aria-label="Видео к загрузке по аудиториям">
-        ${Object.entries(markets).map(([lang, market]) => `<button class="market surface" data-do="filter"
+        ${Object.entries(markets).map(([lang, market]) => {
+          const shownLimit = localLimit(lang);
+          return `<button class="market surface" data-do="filter"
           data-id="${lang}" aria-pressed="${filter === lang}"><span class="market-label">${badge(lang)}
           <span>${countries[market.country]}<small>${market.city}</small></span></span>
-          <strong aria-label="Видео к загрузке: ${metric(counts[lang])}">${metric(counts[lang])}</strong></button>`).join('')}
+          <strong aria-label="Локальный запас: ${metric(counts[lang])}${shownLimit ? ' из ' + metric(shownLimit) : ''}">${metric(counts[lang])}${shownLimit ? '<span> / ' + metric(shownLimit) + '</span>' : ''}</strong></button>`;
+        }).join('')}
       </div>
       <section class="surface">
         <div class="bar">
           <button data-do="filter" data-id="" aria-pressed="${!filter}">Все аудитории</button>
           ${data.live ? '<button class="quiet" data-do="pause">' + (data.settings.paused ? 'Возобновить отправку' : 'Пауза') + '</button>' : '<button class="quiet" data-do="preview">Пример видео</button>'}
         </div>
-        ${queueRows(active.filter(current))}
+        ${publishingNotice()}
+        <h2 class="queue-subhead">Запланировано в YouTube</h2>
+        ${queueRows(scheduled) || '<p class="queue-empty">Подтверждённых дат пока нет.</p>'}
+        <h2 class="queue-subhead">Локальная очередь</h2>
+        ${waiting || '<p class="queue-empty">Готовые видео появятся после монтажа. <a href="#sources">Источники →</a></p>'}
       </section>
-      ${history.length ? '<details class="surface history"><summary>История · ' + history.length + '</summary>' + queueRows(history) + '</details>' : ''}
-      ${data.live && unassigned.length ?
-        '<section class="surface history"><details><summary>Смонтировано · ' + unassigned.length + '</summary><div class="compact-list">' +
-        unassigned.map(clip => `<div>${badge(clip.lang)} <strong>${escape(clip.title)}</strong>
-          <button class="quiet" data-do="preview" data-id="${clip.id}">Видео</button></div>`).join('') + '</div></details></section>' : ''}`;
+      ${history.length ? '<details class="surface history"><summary>История · ' + history.length + '</summary>' + queueRows(history) + '</details>' : ''}`;
   }
 
   function sourceCard(source, clips) {
     const id = escape(source.id);
+    const detailClass = !source.media_state || source.media_state === 'twitch_media_error' ? ' class="error-note"' : '';
     return `<article class="job source">
       <div class="job-title">${badge(source.lang)}<div><strong>${escape(source.title)}</strong>
         ${source.url ? '<a class="muted" href="' + escape(source.url) + '" target="_blank" rel="noopener noreferrer">Ссылка ↗</a>' : ''}
         ${source.kind === 'live' ? '<small>Эфир при последней проверке</small>' : source.kind === 'vod' ? '<small>Запись эфира</small>' : ''}
-        ${source.detail ? '<small class="error-note">' + escape(source.detail) + '</small>' : ''}</div></div>
-      <div class="job-actions">${status(source.status)}
-        ${configurableSources.has(source.status) ? '<button data-do="source" data-id="' + id + '">Настроить монтаж</button>' : ''}
+        ${source.detail ? '<small' + detailClass + '>' + escape(source.detail) + '</small>' : ''}</div></div>
+      <div class="job-actions">${status(labels[source.media_state] ? source.media_state : source.status)}
+        ${configurableSources.has(source.status) ? '<button data-do="source" data-id="' + id + '">' +
+          (source.status === 'waiting' ? 'Добавить исходник' : 'Настроить монтаж') + '</button>' : ''}
         ${source.status === 'waiting' ? '<button class="quiet" data-do="dismiss" data-id="' + id + '">Скрыть</button>' : ''}</div>
       ${clips.length ? `<div class="source-clips" aria-label="Готовые клипы">${clips.map(clip =>
         `<div><span>${escape(clip.title)}</span><button class="quiet" data-do="preview" data-id="${escape(clip.id)}">Смотреть</button></div>`
@@ -190,35 +256,47 @@
   }
 
   function sourcesPage() {
-    const roster = data.roster || {};
+    const automaticOnly = data.strict_ru_sources;
+    const roster = data.roster?.[sourcesLanguage] || [];
+    const ranked = data.ranking_updated?.[sourcesLanguage];
+    const checkedAt = ranked ? new Date(ranked) : null;
+    const lastCheck = checkedAt && !Number.isNaN(checkedAt.getTime())
+      ? ' · ' + checkFormatter.format(checkedAt) : '';
     const clipsBySource = new Map();
     for (const clip of data.clips || []) {
+      if (clip.lang !== sourcesLanguage) continue;
       if (!clipsBySource.has(clip.source_id)) clipsBySource.set(clip.source_id, []);
       clipsBySource.get(clip.source_id).push(clip);
     }
-    return `<div class="heading"><div><h1>Источники</h1><p>YouTube, Twitch и входящие файлы</p></div>${mainButton('+ Источник', 'source')}</div>
+    const sources = data.sources.filter(source => source.lang === sourcesLanguage &&
+      (!automaticOnly || source.rel_file && !source.media_state && ['queued', 'editing'].includes(source.status)));
+    const searching = data.settings.scan && (!data.live || data.search_configured);
+    return `<div class="heading"><div><h1>Источники</h1><p>Twitch · Grand Theft Auto VI</p></div>${automaticOnly ? '' : mainButton('+ Источник', 'source')}</div>
       <section class="surface">
         <div class="bar"><div><strong>Автопоиск</strong>
-          <small>${escape(data.search_status || (!data.live ? 'YouTube и Twitch · каждые 5 часов' : data.search_configured ? 'YouTube и Twitch · каждые 5 часов' : 'Активны входящие файлы. Для YouTube и Twitch нужны ключи API.'))}</small></div>
+          <small>${escape(data.search_status || (!data.live || data.search_configured
+            ? 'Twitch · фоновый поиск'
+            : 'Для поиска по категории нужны параметры API Twitch.'))}</small></div>
           ${data.live ? '<button class="quiet" data-do="scan" aria-pressed="' + data.settings.scan + '">' + (data.settings.scan ? 'Включён' : 'Выключен') + '</button>' : '<span class="status scheduled">Включён по умолчанию</span>'}</div>
-        <div class="roster-grid">${Object.entries(markets).map(([lang, market]) =>
-          `<div><strong>${badge(lang)} ${countries[market.country]}</strong>
-            <small>${data.ranking_updated?.[lang] ? 'Топ ' + (roster[lang]?.length || 0) + ' · по свежей активности' : 'Стартовый список · до первой проверки'}</small>
-            <small>${Array.isArray(roster[lang]) ? roster[lang].map(escape).join(' · ') || 'Нет подходящих результатов' : 'Список авторов на сервере'}</small></div>`).join('')}</div>
-        ${data.sources.length ? '<div class="job-list">' + data.sources.map(source =>
+        <div class="source-roster"><strong>${badge(sourcesLanguage)} ${countries[markets[sourcesLanguage].country]}</strong>
+          <small>${escape((ranked ? 'Последняя проверка Twitch' : 'Ожидает проверки категории') + lastCheck)}</small>
+          ${automaticOnly && sources.length ? '<small>В обработке · ' + metric(sources.length) + '</small>' : ''}
+          ${!automaticOnly && ranked && roster.length ? '<ol>' + roster.map(name => '<li>' + escape(name) + '</li>').join('') + '</ol>' : ''}</div>
+        ${sources.length ? '<div class="job-list">' + sources.map(source =>
           sourceCard(source, clipsBySource.get(source.id) || [])).join('') + '</div>' :
-            '<div class="blank"><strong>Нет источников</strong><p>Добавьте ссылку или положите разрешённый файл в папку нужного языка.</p></div>'}
+            '<div class="blank"><strong>Пока нет материалов для монтажа</strong>' +
+            (searching ? '<p>Автопоиск продолжается.</p>' : '') + '</div>'}
       </section>`;
   }
 
   function accountCard(account) {
-    const state = account.connected ? (account.auto ? 'Авто · приватно' : 'Подключён') : 'Не подключён';
+    const state = account.connected ? (account.auto ? 'Планирует автоматически' : 'Подключён') : 'Не подключён';
     const stats = account.stats || {};
     const reportDate = typeof stats.day === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(stats.day)
       ? stats.day.split('-').reverse().join('.') : '';
     return `<article class="account">
       <div class="account-label"><strong>${escape(account.name)}</strong>
-        <small>${state} · ${escape(countries[account.route] || account.route)}</small>
+        <small>${state} · ${escape(routes[account.route] || account.route)}</small>
         ${account.target ? '<small>' + escape(account.target) + '</small>' : ''}</div>
       <dl class="metrics">
         <div><dt>Просмотры за сутки</dt><dd>${metric(stats.views)}</dd></div>
@@ -256,7 +334,9 @@
 
   function connectionsPage() {
     return `<div class="heading"><div><h1>Подключения</h1><p>${data.live ? 'Доступность API и страна выхода' : 'Проверки выполняются на рабочем сервере'}</p></div></div>
-      <div class="route-grid">${Object.entries(countries).map(([route, title]) => {
+      <div class="route-grid">${Object.entries(routes).map(([route, title]) => {
+        const description = {server: 'Страна определяется при проверке', gateway: 'Проверка доступа к API по HTTPS'}[route]
+          || 'Ожидаемая страна: ' + route;
         const rows = platforms.map(platform => {
           const item = data.connections?.find(entry => entry.route === route && entry.platform === platform);
           const fallback = !data.live ? 'preview' : data.routes?.[route] ? 'unchecked' : 'unconfigured';
@@ -264,7 +344,7 @@
           return {route, platform, ...item, state};
         });
         return `<section class="surface route-card"><div class="route-head"><h2>${title}</h2>
-          <small>${route === 'server' ? 'Страна определяется при проверке' : 'Ожидаемая страна: ' + route}</small></div>
+          <small>${description}</small></div>
           ${rows.map(item => {
             const checked = item.checked_at && Number.isFinite(Date.parse(item.checked_at))
               ? checkFormatter.format(new Date(item.checked_at)) + ' МСК' : '';
@@ -313,6 +393,8 @@
       profile = result.edit;
     }
     const mode = profile?.mode || 'auto';
+    const preferredLanguage = source?.lang || sourcesLanguage;
+    const languageOptions = page === 'sources' ? [preferredLanguage] : Object.keys(languages);
     const moments = (profile?.moments || []).map(({start_seconds, end_seconds, headline}) =>
       [start_seconds, end_seconds, headline].filter(value => value != null && value !== '').join(' — ')).join('\n');
     open(source ? 'Настроить монтаж' : 'Добавить источник', `<form id="source-form" data-id="${source?.id || ''}">
@@ -320,7 +402,7 @@
         `<input name="${field}" type="hidden" value="${escape(profile[field])}">`).join('')}
       ${!data.live ? '<p class="muted">В предпросмотре доступен только интерфейс. Обработку запускает локальный сервис.</p>' : ''}
       <div class="form-columns">
-        <label>Язык<select name="lang" ${source ? 'disabled' : ''}>${Object.entries(languages).map(([lang, text]) => option(lang, text, source?.lang)).join('')}</select></label>
+        <label>Язык<select name="lang" ${source ? 'disabled' : ''}>${languageOptions.map(lang => option(lang, languages[lang], preferredLanguage)).join('')}</select></label>
         <label>Название источника<input name="title" maxlength="140" value="${escape(source?.title)}"></label>
       </div>
       ${!source || source.url ? `<label>Ссылка YouTube или Twitch<input name="url" type="url" maxlength="2048" placeholder="https://…" value="${escape(source?.url)}" ${source ? 'readonly' : ''}></label>` : ''}
@@ -423,7 +505,7 @@
   }
 
   function routeOptions(selected) {
-    return Object.entries(countries).map(([id, name]) => option(
+    return Object.entries(routes).map(([id, name]) => option(
       id, name + (data.routes && !data.routes[id] ? ' · не настроен' : ''), selected,
     )).join('');
   }
@@ -448,36 +530,55 @@
       <label>Название<input name="name" required maxlength="100" value="${escape(account?.name || defaults[lang])}"></label>
       <label><span data-label="target">${targetLabel(platform)}</span><input name="target" required maxlength="100" placeholder="${platform === 'YouTube' ? 'UC…' : '@имя'}" value="${escape(account?.target)}"></label>
       <label>Маршрут отправки<select name="route">${routeOptions(account?.route || 'server')}</select></label>
+      ${data.youtube_gateway_required ? `<small data-gateway-hint ${platform === 'YouTube' ? '' : 'hidden'}>Для отправки в YouTube требуется доверенный шлюз.</small>` : ''}
       <div class="button-row"><button type="button" data-do="check" ${data.live ? '' : 'disabled'}>Проверить соединение</button>
         <button class="primary" ${data.live ? '' : 'disabled'}>Сохранить</button></div>
       <p class="form-error" role="status"></p>
       ${account && platform === 'YouTube' ? `<div class="integration">
         <button type="button" data-do="oauth" data-id="${account?.id || ''}" ${available ? '' : 'disabled'}>${account?.connected ? 'Переподключить Google' : 'Подключить Google'}</button>
-        ${account?.connected && data.uploads ? '<button type="button" data-do="auto" data-id="' + account.id + '">' + (account.auto ? 'Выключить авто' : 'Авто · приватно') + '</button>' : ''}
-        <small>${!data.oauth ? 'Для подключения нужны настройки Google OAuth на сервере.' : 'Используется сохранённый маршрут. Загрузки пилота — приватные.'}</small>
+        ${account?.connected && data.uploads ? '<button type="button" data-do="auto" data-id="' + account.id + '">' + (account.auto ? 'Выключить автопланирование' : 'Включить автопланирование') + '</button>' : ''}
+        <small>${!data.oauth ? 'Для подключения нужны настройки Google OAuth на сервере.' : 'Видео доступно в YouTube Studio после предварительной загрузки.'}</small>
+        ${data.live && !account.connected ? '<details><summary>Настройки входа Google</summary><p>Адрес возврата <code>' +
+          escape(location.origin + '/oauth/youtube') + '</code></p><small>Для проекта в режиме Testing добавьте владельца канала в Test users.</small></details>' : ''}
         </div>` : account ? '<small>Готовое видео можно скачать из очереди для ручной публикации.</small>' : ''}
       </form>`);
   }
 
   function preview(id) {
     const url = data.live ? '/media/' + id : 'assets/clip-preview.mp4';
-    open('Видеофайл', `<div class="preview"><video controls playsinline src="${escape(url)}"></video>
-      <a class="button" href="${escape(url)}" download="streamcut-${id || 'example'}.mp4">Скачать MP4</a></div>`);
+    const clip = data.clips?.find(row => row.id === id);
+    open(clip?.title || 'Видеофайл', `<div class="preview"><video controls playsinline src="${escape(url)}"></video>
+      <a class="button" href="${escape(url)}" download="streamcut-${id || 'example'}.mp4">Скачать MP4</a>
+      ${clip?.description ? '<p class="clip-description">' + escape(clip.description) + '</p>' : ''}
+      ${Array.isArray(clip?.hashtags) && clip.hashtags.length ? '<small>' + clip.hashtags.map(escape).join(' ') + '</small>' : ''}
+      </div>`);
   }
 
   function edit(id) {
     const job = data.queue.find(row => row.id === id);
     if (!job) return;
-    const current = new Date(job.at) > new Date() ? new Date(job.at) : new Date(Date.now() + 3600000);
+    const onYouTube = job.status === 'preloaded';
+    const account = jobAccount(job);
+    const youtubeReady = job.platform === 'YouTube' && data.uploads && data.oauth && account?.connected;
+    const gatewayReady = !data.youtube_gateway_required || (data.routes?.gateway && account?.route === 'gateway');
+    const ready = youtubeReady && gatewayReady;
+    const unavailable = !youtubeReady ? 'Для переноса или планирования на YouTube нужно подключить Google и включить отправку.'
+      : 'Для переноса или планирования на YouTube нужен доверенный шлюз.';
+    const instant = new Date(jobTime(job));
+    const current = instant > new Date() ? instant : new Date(Date.now() + 3600000);
     open(job.title, `<form id="job-form" data-id="${id}">
       <p class="muted">${escape(platformName(job.platform))} · [${job.lang}] ${escape(job.account)}</p>
       <div class="button-row"><button type="button" data-do="preview" data-id="${job.clip_id}">Смотреть</button>
         <a class="button" href="/media/${job.clip_id}" download="streamcut-${job.clip_id}.mp4">Скачать</a></div>
       <label>Дата и время · ${markets[job.lang].city}<input name="at" type="datetime-local" required value="${localFormatters[job.lang].format(current).replace(' ', 'T')}"></label>
+      ${!ready ? '<small>' + unavailable + '</small>' : ''}
       <p class="form-error" role="status"></p>
-      <div class="button-row"><button type="button" class="quiet" data-do="cancel-job" data-id="${id}">Снять с очереди</button>
-        <button name="action" value="save">Сохранить время</button>
-        ${job.platform === 'YouTube' && data.uploads ? '<button class="primary" name="action" value="send">Подтвердить приватную загрузку</button>' : ''}</div>
+      <div class="button-row">
+        ${onYouTube ? '<button class="primary" name="action" value="save"' + (ready ? '' : ' disabled') + '>Перенести в YouTube</button>' :
+          '<button type="button" class="quiet" data-do="cancel-job" data-id="' + id + '">Снять с очереди</button>' +
+          '<button name="action" value="save">Сохранить время</button>' +
+          (ready ? '<button class="primary" name="action" value="send">Запланировать на YouTube</button>' : '')}
+      </div>
       </form>`);
   }
 
@@ -514,7 +615,7 @@
       const [route, platform] = form ? [form.elements.route.value, form.elements.platform.value] : value.split('/');
       const result = await post('check', {route, platform});
       const message = result.state && result.state !== 'ok' ? result.detail || healthLabels[result.state]
-        : 'Выход: ' + result.country + ' · API отвечает';
+        : result.country ? 'Выход: ' + result.country + ' · API отвечает' : 'API отвечает по HTTPS';
       if (form) form.querySelector('.form-error').textContent = message;
       else notify(message);
     } else if (action === 'oauth') {
@@ -522,7 +623,7 @@
       location.assign(response.url);
     } else if (action === 'auto') {
       const account = data.accounts.find(row => row.id === id);
-      if (!account.auto && !confirm('Автоматически отправлять новые клипы этого языка в YouTube как приватные?')) return;
+      if (!account.auto && !confirm('Включить автоматическое планирование для новых клипов этого языка?')) return;
       await post('auto', {id, enabled: !account.auto});
       dialog.close();
     } else if (action === 'cancel-job') {
@@ -568,6 +669,8 @@
       } else if (event.target.name === 'platform') {
         form.querySelector('[data-label="target"]').textContent = targetLabel(event.target.value);
         form.elements.target.placeholder = event.target.value === 'YouTube' ? 'UC…' : '@имя';
+        const hint = form.querySelector('[data-gateway-hint]');
+        if (hint) hint.hidden = event.target.value !== 'YouTube';
       }
     }
   });
@@ -578,7 +681,8 @@
     const form = event.target;
     const payload = Object.fromEntries(new FormData(form));
     const error = form.querySelector('.form-error');
-    for (const button of form.querySelectorAll('button')) button.disabled = true;
+    const enabled = [...form.querySelectorAll('button')].filter(button => !button.disabled);
+    for (const button of enabled) button.disabled = true;
     try {
       if (form.id === 'source-form') {
         await saveSource(form, payload, error);
@@ -600,7 +704,7 @@
     } catch (problem) {
       error.textContent = problem.message;
     } finally {
-      for (const button of form.querySelectorAll('button')) button.disabled = false;
+      for (const button of enabled) button.disabled = false;
       if (form.id === 'account-form') {
         const oauth = form.querySelector('[data-do="oauth"]');
         if (oauth) oauth.disabled = !data.oauth || !oauth.dataset.id;
