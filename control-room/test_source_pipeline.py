@@ -179,7 +179,7 @@ class SourcePipelineTests(unittest.TestCase):
                     service.search()
             self.assertEqual(directory.call_count, 2)
             state = service.snapshot()
-            self.assertEqual(state["source_health"], {"archives": 1, "accessible": 0, "active": 0})
+            self.assertEqual(state["source_health"], {"archives": 1, "clips": 0, "accessible": 0, "active": 0})
             self.assertEqual(state["inventory_limit"], 30)
             self.assertEqual(state["queue_counts"]["RU"], 30)
             media = service.input / "RU" / "twitch-vod-125.mp4"
@@ -191,7 +191,7 @@ class SourcePipelineTests(unittest.TestCase):
                 service.edit_one()
             cutter.assert_not_called()
             state = service.snapshot()
-            self.assertEqual(state["source_health"], {"archives": 0, "accessible": 0, "active": 1})
+            self.assertEqual(state["source_health"], {"archives": 0, "clips": 0, "accessible": 0, "active": 1})
             self.assertEqual([item["status"] for item in state["sources"]], ["queued"])
 
     def test_directory_checks_every_30_minutes_and_registers_only_successful_downloads(self):
@@ -226,8 +226,39 @@ class SourcePipelineTests(unittest.TestCase):
 
                 fetch.side_effect = download
                 service.fetch_twitch_media()
-                service.scan()
             self.assertEqual([row["status"] for row in service.snapshot()["sources"]], ["queued"])
+
+    def test_strict_media_skips_watch_only_and_denied_items_then_queues_the_available_clip(self):
+        service = self.service()
+        observed = studio.iso(studio.now())
+        candidates = [
+            dict(lang="RU", kind="video", url=f"https://clips.twitch.tv/{clip}",
+                 twitch_user=str(rank), title="GTA VI", creator=f"Канал {rank}", author=str(rank),
+                 key=f"twitch:clip:{clip}", clip_id=clip, directory_followup=True, directory_priority=rank,
+                 observed=observed, popularity=10, provider="Twitch")
+            for rank, clip in enumerate(("WatchOnly", "Denied", "Downloadable"), 1)
+        ]
+        settings = {"STREAMCUT_TWITCH_STRICT_RU": "1", "TWITCH_CLIENT_ID": "id", "TWITCH_CLIENT_SECRET": "secret"}
+
+        def download(candidate, destination, *, current):
+            if candidate["clip_id"] == "Denied":
+                raise studio.transport.ConnectionProblem("HTTP 403")
+            destination.write_bytes(b"media returned from official download")
+            return destination
+
+        with patch.dict(os.environ, settings, clear=True), patch("twitch_directory.search", return_value={
+                "RU": candidates, "EN": [], "ESP": [],
+        }), patch("twitch_media.configured", side_effect=lambda item: item["clip_id"] != "WatchOnly"), patch(
+                "twitch_media.fetch", side_effect=download) as fetch:
+            service.search(force=True)
+            self.assertEqual(service.snapshot()["sources"], [])
+            service.fetch_twitch_media()
+            self.assertEqual([call.args[0]["clip_id"] for call in fetch.call_args_list], ["Denied", "Downloadable"])
+            state = service.snapshot()
+            self.assertEqual([(item["url"], item["status"], item["rel_file"]) for item in state["sources"]],
+                             [(candidates[2]["url"], "queued", "twitch-clip-Downloadable.mp4")])
+            with service.db() as db:
+                self.assertEqual(db.execute("SELECT count(*) FROM sources").fetchone()[0], 1)
 
     def test_old_database_can_store_profile_without_discarding_sources(self):
         with sqlite3.connect(self.root / "studio.db") as db:

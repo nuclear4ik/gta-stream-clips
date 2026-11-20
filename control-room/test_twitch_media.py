@@ -18,6 +18,8 @@ CURRENT = datetime(2026, 11, 19, 4, tzinfo=timezone.utc)
 VOD = {"kind": "vod", "url": "https://www.twitch.tv/videos/10", "archive_id": "10",
        "twitch_user": "11", "lang": "RU", "game_id": "13",
        "observed": (CURRENT - timedelta(hours=2)).isoformat()}
+DIRECT_CLIP = {"kind": "video", "clip_id": "Discovered", "url": "https://clips.twitch.tv/Discovered",
+               "twitch_user": "11", "lang": "RU"}
 ENV = {"TWITCH_CLIENT_ID": "test", "STREAMCUT_TWITCH_CLIP_TOKEN_11": "protected-token",
        "STREAMCUT_TWITCH_CLIP_EDITOR_ID_11": "15"}
 APP_ENV = {"TWITCH_CLIENT_ID": "test", "TWITCH_CLIENT_SECRET": "test-secret",
@@ -45,6 +47,32 @@ class FakeResponse(BytesIO):
 
 
 class TwitchMediaTests(unittest.TestCase):
+    def test_direct_category_clip_uses_official_download_without_requiring_a_vod(self):
+        with TemporaryDirectory() as folder, patch.dict(os.environ, APP_ENV, clear=True), patch(
+                "discovery.twitch_headers", return_value=APP_HEADERS), patch("discovery.helix", return_value=[
+                    {"clip_id": "Discovered", "landscape_download_url": f"https://{CDN}/direct.mp4"},
+                ]) as helix, patch("twitch_media.HTTPSConnection") as connect:
+            target = Path(folder) / "twitch-clip-Discovered.mp4"
+            connect.return_value.getresponse.return_value = FakeResponse(FILE, str(len(FILE)))
+            self.assertEqual(twitch_media.filename(DIRECT_CLIP), target.name)
+            self.assertEqual(twitch_media.fetch(DIRECT_CLIP, target), target)
+            self.assertEqual(target.read_bytes(), FILE)
+            helix.assert_called_once_with("clips/downloads", [
+                ("broadcaster_id", "11"), ("editor_id", "15"), ("clip_id", "Discovered"),
+            ], APP_HEADERS, "Разрешение на скачивание Twitch")
+
+    def test_public_clip_metadata_without_download_grant_does_not_trigger_download(self):
+        with TemporaryDirectory() as folder, patch("discovery.helix") as helix, patch(
+                "twitch_media.HTTPSConnection") as connect:
+            target = Path(folder) / "twitch-clip-Discovered.mp4"
+            with patch.dict(os.environ, {"TWITCH_CLIENT_ID": "test", "TWITCH_CLIENT_SECRET": "secret"}, clear=True):
+                self.assertIsNone(twitch_media.fetch(DIRECT_CLIP, target))
+            with patch.dict(os.environ, ENV, clear=True):
+                self.assertIsNone(twitch_media.fetch(DIRECT_CLIP | {"clip_id": "Other"}, target))
+            helix.assert_not_called()
+            connect.assert_not_called()
+            self.assertFalse(target.exists())
+
     def test_receives_creator_archive_only_for_exact_vod_and_broadcaster(self):
         with TemporaryDirectory() as folder, patch("discovery.helix") as helix, patch(
                 "twitch_media.HTTPSConnection") as connect:

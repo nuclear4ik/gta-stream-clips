@@ -45,9 +45,11 @@ def configured(candidate=None):
     if candidate is None:
         return bool(os.environ.get(ARCHIVE_INDEX)) or clip_configured(None)
     broadcaster = candidate.get("twitch_user")
-    if candidate.get("kind") != "vod" or not isinstance(broadcaster, str) or not discovery.TWITCH_ID.fullmatch(broadcaster):
+    if not isinstance(broadcaster, str) or not discovery.TWITCH_ID.fullmatch(broadcaster):
         return False
-    return clip_configured(broadcaster) or bool(indexed_archive(candidate))
+    if candidate.get("kind") == "vod":
+        return clip_configured(broadcaster) or bool(indexed_archive(candidate))
+    return bool(filename(candidate) and clip_configured(broadcaster))
 
 
 def origin(candidate):
@@ -56,6 +58,25 @@ def origin(candidate):
     if not match or candidate.get("archive_id", match[1]) != match[1]:
         raise ValueError("Нужен подтверждённый ID записи Twitch.")
     return match[1]
+
+
+def clip_origin(candidate):
+    identifier = candidate.get("clip_id")
+    if (not isinstance(identifier, str) or not CLIP_ID.fullmatch(identifier)
+            or candidate.get("url") != f"https://clips.twitch.tv/{identifier}"):
+        raise ValueError("Нужен подтверждённый ID клипа Twitch.")
+    return identifier
+
+
+def filename(candidate):
+    try:
+        if candidate.get("kind") == "vod":
+            return f"twitch-vod-{origin(candidate)}.mp4"
+        if candidate.get("kind") == "video":
+            return f"twitch-clip-{clip_origin(candidate)}.mp4"
+    except ValueError:
+        return None
+    return None
 
 
 def indexed_archive(candidate):
@@ -172,14 +193,19 @@ def fetch(candidate, destination, *, current=None):
     if not configured(candidate):
         return None
     broadcaster = candidate["twitch_user"]
-    vod = origin(candidate)
+    is_archive = candidate["kind"] == "vod"
+    vod = origin(candidate) if is_archive else None
     destination = Path(destination)
     if destination.suffix.lower() != ".mp4":
         raise ValueError("Имя файла Twitch должно оканчиваться на .mp4.")
     if destination.exists() or destination.is_symlink():
         return destination if destination.is_file() and not destination.is_symlink() else None
-    if url := indexed_archive(candidate):
-        return download(url, destination, archive=True)
+    if is_archive and (url := indexed_archive(candidate)):
+        try:
+            return download(url, destination, archive=True)
+        except discovery.ConnectionProblem:
+            if not clip_configured(broadcaster):
+                raise
     if not clip_configured(broadcaster):
         return None
     editor = os.environ.get(EDITOR_KEY + broadcaster, "").strip() or broadcaster
@@ -190,7 +216,10 @@ def fetch(candidate, destination, *, current=None):
         headers = {"Client-Id": client, "Authorization": "Bearer " + token}
     else:
         headers = discovery.twitch_headers(client, os.environ["TWITCH_CLIENT_SECRET"])
-    ids = clip_options(candidate, broadcaster, vod, current or datetime.now(timezone.utc), headers)
+    if is_archive:
+        ids = clip_options(candidate, broadcaster, vod, current or datetime.now(timezone.utc), headers)
+    else:
+        ids = [clip_origin(candidate)]
     if not ids:
         return None
     links = discovery.helix("clips/downloads", [("broadcaster_id", broadcaster), ("editor_id", editor),

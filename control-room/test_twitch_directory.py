@@ -31,6 +31,14 @@ def archive(user, language, current, **fields):
                 view_count=20, title="Запись прямого эфира") | fields
 
 
+def paged(rows, cursor=None):
+    return {"data": rows, "pagination": {"cursor": cursor} if cursor else {}}
+
+
+def paging_from_helix(endpoint, params, headers, action):
+    return paged(discovery.helix(endpoint, params, headers, action))
+
+
 class TwitchDirectoryTests(unittest.TestCase):
     def test_only_top_ten_broadcasters_per_language_are_queried_for_archives(self):
         offsets = {"ru": 0, "en": 100, "es": 200}
@@ -154,9 +162,10 @@ class TwitchDirectoryTests(unittest.TestCase):
                 return [live(1, "ru", 400), live(2, "en", 600)]
             self.assertEqual(options["language"], "ru")
             if "game_id" in options:
-                self.assertEqual(options["sort"], "time")
                 return [archive(5, "ru", current), archive(7, "en", current),
                         archive(8, "ru", current, viewable="private"), archive(1, "ru", current)]
+            if options["sort"] != "time":
+                return []
             user = options["user_id"]
             videos_requested.append(user)
             return {"1": [archive(1, "ru", current)],
@@ -166,7 +175,8 @@ class TwitchDirectoryTests(unittest.TestCase):
         env = SECRETS | {twitch_directory.STRICT_RU: "1", "STREAMCUT_TWITCH_RU": "creator_6|creator_4"}
         with patch.dict(os.environ, env, clear=True), patch(
                 "discovery.twitch_headers", return_value={}), patch("discovery.helix", side_effect=feed), patch(
-                "discovery.request") as direct:
+                "twitch_clips.helix_page", side_effect=paging_from_helix), patch(
+                "twitch_clips.search", return_value=[]), patch("discovery.request") as direct:
             found = twitch_directory.search(LANGUAGES, current)
         direct.assert_not_called()
         self.assertEqual(videos_requested, ["1", "6", "4"])
@@ -181,13 +191,14 @@ class TwitchDirectoryTests(unittest.TestCase):
         current = datetime(2026, 11, 19, 9, tzinfo=timezone.utc)
         env = SECRETS | {twitch_directory.STRICT_RU: "1"}
         with patch.dict(os.environ, env, clear=True), patch(
-                "discovery.twitch_headers", return_value={}), patch(
+                "discovery.twitch_headers", return_value={}), patch("twitch_clips.search", return_value=[]), patch(
+                "twitch_clips.helix_page", side_effect=paging_from_helix), patch(
                 "discovery.helix", side_effect=[
                     [{"id": GAME, "name": "Grand Theft Auto VI"}], [],
-                    [archive(10, "ru", current)],
+                    [archive(10, "ru", current)], [archive(10, "ru", current)],
                 ]) as helix:
             found = twitch_directory.search(LANGUAGES, current)
-        self.assertEqual([call.args[0] for call in helix.call_args_list], ["games", "streams", "videos"])
+        self.assertEqual([call.args[0] for call in helix.call_args_list], ["games", "streams", "videos", "videos"])
         self.assertEqual([entry["archive_id"] for entry in found["RU"]], ["3010"])
         self.assertEqual((found["EN"], found["ESP"]), ([], []))
 
@@ -212,10 +223,119 @@ class TwitchDirectoryTests(unittest.TestCase):
         ]
         prior[-1]["observed"] = (current - timedelta(days=4)).isoformat()
         with patch.dict(os.environ, env, clear=True), patch(
-                "discovery.twitch_headers", return_value={}), patch("discovery.helix", side_effect=feed):
+                "discovery.twitch_headers", return_value={}), patch("discovery.helix", side_effect=feed), patch(
+                "twitch_clips.helix_page", side_effect=paging_from_helix), patch("twitch_clips.search", return_value=[]):
             found = twitch_directory.search(LANGUAGES, current, previous={"RU": prior})
         self.assertEqual([item["archive_id"] for item in found["RU"]], ["3010"])
         self.assertNotIn("directory_priority", found["RU"][0])
+
+    def test_ru_poll_rotates_paged_variants_and_keeps_only_ten_display_ranks(self):
+        current = datetime(2026, 11, 20, 8, tzinfo=timezone.utc)
+        env = SECRETS | {twitch_directory.STRICT_RU: "1"}
+        recording_queries = []
+        clip = dict(lang="RU", kind="video", provider="Twitch", directory_followup=True, game_id=GAME,
+                    twitch_user="201", key="twitch:clip:example", clip_id="example", observed=current.isoformat())
+
+        def helix(endpoint, params, _headers, _action):
+            if endpoint == "games":
+                return []
+            if endpoint == "search/categories":
+                return [{"id": "501", "name": "Grand Theft Auto V"}, {"id": GAME, "name": "Grand Theft Auto VI"}]
+            if endpoint == "videos":
+                return []
+            self.fail(f"Unexpected endpoint {endpoint}")
+
+        def page(endpoint, params, _headers, _action):
+            options = dict(params)
+            if endpoint == "streams":
+                cursor = options.get("after")
+                if cursor:
+                    self.assertEqual(cursor, "more-streams")
+                    return paged([live(9, "ru", 10), live(101, "ru", 5), live(102, "en", 5000)])
+                return paged([live(user, "ru", 100 - user) for user in range(1, 11)], "more-streams")
+            self.assertEqual(options["language"], "ru")
+            if "user_id" in options:
+                return paged([])
+            recording_queries.append((options["sort"], options["period"], options.get("after")))
+            if options["sort"] == "time":
+                return paged([])
+            if options.get("after"):
+                self.assertEqual(options["after"], "more-archives")
+                return paged([archive(200, "ru", current)])
+            return paged([], "more-archives")
+
+        with patch.dict(os.environ, env, clear=True), patch("discovery.twitch_headers", return_value={}), patch(
+                "discovery.helix", side_effect=helix), patch("twitch_clips.helix_page", side_effect=page), patch(
+                "twitch_clips.search", side_effect=[[clip.copy(), clip.copy()], []]):
+            found = twitch_directory.search(LANGUAGES, current)["RU"]
+            next_poll = twitch_directory.search(LANGUAGES, current + timedelta(minutes=30), previous={"RU": found})["RU"]
+        self.assertEqual([row["directory_rank"] for row in found if "directory_rank" in row], list(range(1, 11)))
+        self.assertTrue(any(row["twitch_user"] == "101" and row["directory_followup"] for row in found))
+        self.assertFalse(any(row["twitch_user"] == "102" for row in found))
+        self.assertEqual([row["archive_id"] for row in found if row["kind"] == "vod"], ["3200"])
+        self.assertEqual(sum(row.get("clip_id") == "example" for row in found), 1)
+        self.assertEqual(sum(row.get("clip_id") == "example" for row in next_poll), 1)
+        self.assertEqual(recording_queries[0], ("time", "week", None))
+        self.assertEqual(recording_queries[1][:2], recording_queries[2][:2])
+        self.assertEqual(recording_queries[2][2], "more-archives")
+        self.assertEqual(recording_queries[3], recording_queries[0])
+        self.assertNotEqual(recording_queries[4][:2], recording_queries[1][:2])
+
+    def test_directory_pagination_uses_helix_response_data_and_cursor(self):
+        responses = [paged([{"id": "1"}], "next+page"), paged([{"id": "2"}])]
+        with patch("discovery.request", side_effect=[
+            (200, {}, json.dumps(response).encode()) for response in responses
+        ]) as request:
+            rows = twitch_directory.directory_pages("videos", [("language", "ru")], {}, "Каталог", 3)
+        self.assertEqual(rows, [{"id": "1"}, {"id": "2"}])
+        self.assertEqual([call.args[3] for call in request.call_args_list],
+                         ["/helix/videos?language=ru", "/helix/videos?language=ru&after=next%2Bpage"])
+
+    def test_ru_poll_refreshes_first_page_then_resumes_deeper_catalog_from_saved_cursor(self):
+        current = datetime(2026, 11, 20, 8, tzinfo=timezone.utc)
+        requests = []
+
+        def page(endpoint, params, _headers, _description):
+            if endpoint != "streams":
+                return paged([])
+            cursor = dict(params).get("after")
+            requests.append(cursor)
+            return {
+                None: paged([live(1, "ru", 100)], "second"),
+                "second": paged([live(2, "ru", 40)], "third"),
+                "third": paged([live(3, "ru", 10)]),
+            }[cursor]
+
+        env = SECRETS | {twitch_directory.STRICT_RU: "1"}
+        with patch.dict(os.environ, env, clear=True), patch("discovery.twitch_headers", return_value={}), patch(
+                "twitch_directory.category_id", return_value=GAME), patch("twitch_directory.archive_rows", return_value=[]), patch(
+                "twitch_clips.search", return_value=[]), patch("twitch_directory.CATEGORY_STREAM_PAGES", 2), patch(
+                "twitch_clips.helix_page", side_effect=page):
+            first = twitch_directory.search(LANGUAGES, current)
+            second = twitch_directory.search(LANGUAGES, current + timedelta(minutes=30), previous=first)
+            twitch_directory.search(LANGUAGES, current + timedelta(hours=1), previous=second)
+
+        self.assertEqual(requests, [None, "second", None, "third", None, "second"])
+        self.assertEqual(first["RU"][0]["directory_after"], "third")
+        self.assertTrue(any(row["twitch_user"] == "3" for row in second["RU"]))
+        self.assertTrue(all("directory_after" not in row for row in second["RU"]))
+
+    def test_an_expired_stream_cursor_returns_to_the_fresh_page_chain(self):
+        requests = []
+
+        def page(_endpoint, params, _headers, _description):
+            cursor = dict(params).get("after")
+            requests.append(cursor)
+            if cursor == "expired":
+                raise discovery.ConnectionProblem("Invalid cursor")
+            return paged([{"id": "head"}], "fresh") if cursor is None else paged([{"id": "deep"}])
+
+        with patch("twitch_clips.helix_page", side_effect=page):
+            pages, cursor = twitch_directory.browse_directory_pages("streams", [], {}, "Каталог", 3,
+                                                                    previous_cursor="expired")
+        self.assertEqual(requests, [None, "expired", "fresh"])
+        self.assertEqual(pages, [[{"id": "head"}], [{"id": "deep"}]])
+        self.assertIsNone(cursor)
 
     def test_missing_key_and_missing_exact_category(self):
         current = datetime(2026, 11, 19, tzinfo=timezone.utc)

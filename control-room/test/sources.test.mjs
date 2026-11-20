@@ -155,16 +155,17 @@ test('discovered Twitch sources show their acquisition stage', async () => {
   assert.doesNotMatch(app.innerHTML, /Нужен исходный файл/);
 });
 
-test('strict RU Sources hides inaccessible discoveries and keeps manual and ready items', async () => {
+test('strict RU Sources shows only files accepted for automatic editing', async () => {
   const fixtures = [
     ['Скрытый эфир', 'twitch_wait_archive'],
     ['Скрытая запись без доступа', 'twitch_wait_access'],
     ['Скрытая запись без проверки', 'twitch_wait_check'],
-    ['Ссылка добавлена вручную', 'twitch_wait_archive', {manual: true}],
-    ['Исходник на диске', 'twitch_wait_access', {rel_file: 'fixture.mp4'}],
-    ['Готовый источник', 'twitch_wait_check', {status: 'ready'}],
-    ['Источник с экспортом', 'twitch_wait_check'],
-    ['Доступная запись Twitch', 'twitch_wait_media'],
+    ['Ссылка добавлена вручную', undefined, {manual: true}],
+    ['Ожидает настройки монтажа', undefined, {status: 'waiting_layout', rel_file: 'manual.mp4'}],
+    ['Готовый источник', undefined, {status: 'ready', rel_file: 'ready.mp4'}],
+    ['Файл ещё не получен', undefined, {status: 'queued'}],
+    ['Файл в очереди', undefined, {status: 'queued', rel_file: 'queue.mp4'}],
+    ['Файл в монтаже', undefined, {status: 'editing', rel_file: 'editing.mp4'}],
   ];
   const {app, navigate} = await panel(() => assert.fail('source filtering is display only'), {
     strict_ru_sources: true,
@@ -172,19 +173,20 @@ test('strict RU Sources hides inaccessible discoveries and keeps manual and read
     ranking_updated: {RU: '2026-11-19T08:00:00+00:00'},
     sources: fixtures.map(([title, media_state, extra], index) =>
       ({id: index + 1, lang: 'RU', title, media_state, status: 'waiting', ...extra})),
-    clips: [{id: 2, source_id: 7, lang: 'RU', title: 'Готовый клип'}],
+    clips: [{id: 2, source_id: 6, lang: 'RU', title: 'Готовый клип'}],
     queue: [{id: 3, clip_id: 2, status: 'preloaded', lang: 'RU', platform: 'YouTube',
       title: 'Клип в расписании', at: '2026-11-19T12:00:00+00:00'}],
   });
-  assert.doesNotMatch(app.innerHTML, /Скрытый эфир|Скрытая запись|Foreign channel/);
-  for (const [title] of fixtures.slice(3)) assert.match(app.innerHTML, new RegExp(title));
-  assert.match(app.innerHTML, /Проверенный канал/);
-  assert.match(app.innerHTML, /Готовый клип/);
+  for (const [title] of fixtures.slice(0, -2)) assert.doesNotMatch(app.innerHTML, new RegExp(title));
+  for (const [title] of fixtures.slice(-2)) assert.match(app.innerHTML, new RegExp(title));
+  assert.match(app.innerHTML, /В обработке · 2/);
+  assert.doesNotMatch(app.innerHTML, /Проверенный канал|Foreign channel|Готовый клип|Настроить монтаж|Добавить исходник|\+ Источник/);
   navigate('queue');
   assert.match(app.innerHTML, /Клип в расписании/);
+  assert.match(app.innerHTML, /\+ Источник/);
 });
 
-test('Sources explains why fresh Twitch results are not in the editing queue', async () => {
+test('strict RU Sources reports an empty workflow with the last Twitch check', async () => {
   const {app, navigate} = await panel(() => assert.fail('local display only'), {
     strict_ru_sources: true,
     search_configured: true,
@@ -193,8 +195,10 @@ test('Sources explains why fresh Twitch results are not in the editing queue', a
     queue_counts: {RU: 30, EN: 0, ESP: 0},
     inventory_limit: 30,
   });
-  assert.match(app.innerHTML, /Новых записей: 63 · настроено получение: 0 · в обработке: 0/);
-  assert.match(app.innerHTML, /Для монтажа нужен доступ к файлу/);
+  assert.match(app.innerHTML, /Последняя проверка Twitch · 19\.11\.2026, 11:00/);
+  assert.match(app.innerHTML, /Пока нет материалов для монтажа/);
+  assert.match(app.innerHTML, /Автопоиск продолжается/);
+  assert.doesNotMatch(app.innerHTML, /Новых записей|доступ к файлу|настроено получение/);
   navigate('queue');
   assert.match(app.innerHTML, /Локальный запас: 30 из 30/);
   assert.doesNotMatch(app.innerHTML, /Локальный запас: 0 из 30/);

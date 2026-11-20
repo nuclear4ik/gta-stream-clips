@@ -46,6 +46,7 @@ AUTO_RENDER_BATCH = 3
 MIN_SPEECH_CONFIDENCE = 0.90
 PUBLISH_LEAD = timedelta(minutes=15)
 TWITCH_DISCOVERY_INTERVAL = timedelta(minutes=30)
+TWITCH_MEDIA_ATTEMPTS = 5
 RESERVING_QUEUE_STATES = ("scheduled", "route_wait", "checking", "sending", "unknown",
                           "remote_check", "preloaded", "uploaded")
 TWITCH_FILE_PENDING = "Автоматическое получение пока не вернуло файл. Сервис проверит запись снова."
@@ -302,7 +303,7 @@ class Studio:
             roster, ranking_updated, ranked = self.current_discovery(db, instant)
             queue_counts = self.ready_counts(db)
             recordings = {(lang, item["url"]): item for lang, (_, entries) in ranked.items()
-                          for item in entries if item["provider"] == "Twitch" and item["kind"] == "vod"}
+                          for item in entries if item["provider"] == "Twitch" and twitch_media.filename(item)}
             source_health = self.twitch_source_health(db, recordings.values()) if strict_sources else None
             visible_sources = []
             for source in sources:
@@ -310,13 +311,9 @@ class Studio:
                 broadcaster = source.pop("twitch_broadcaster")
                 discovered = seen is not None or broadcaster is not None
                 source["manual"] = seen is None
-                is_twitch = source["url"].startswith(("https://www.twitch.tv/", "https://clips.twitch.tv/"))
-                if strict_sources:
-                    if source["lang"] != "RU":
-                        continue
-                    if is_twitch and discovered and source["status"] in (
-                            "waiting", "waiting_layout", "failed", "empty", "ready"):
-                        continue
+                if strict_sources and (source["lang"] != "RU" or not source["rel_file"]
+                                       or source["status"] not in ("queued", "editing")):
+                    continue
                 if discovered and source["status"] == "waiting" and source["url"].startswith("https://www.twitch.tv/"):
                     candidate = recordings.get((source["lang"], source["url"]))
                     source["media_state"], source["detail"] = self.twitch_source_status(
@@ -661,8 +658,8 @@ class Studio:
             known = {(r["lang"], r["rel_file"]) for r in db.execute(
                 "SELECT lang,rel_file FROM sources WHERE rel_file IS NOT NULL")}
             _, _, ranked = self.current_discovery(db, now())
-            twitch_records = {(lang, self.twitch_archive_filename(item)): item for lang, (_, items) in ranked.items()
-                              for item in items if item["provider"] == "Twitch" and item["kind"] == "vod"}
+            twitch_records = {(lang, filename): item for lang, (_, items) in ranked.items() for item in items
+                              if item["provider"] == "Twitch" and (filename := twitch_media.filename(item))}
         for lang, files in self.available_files().items():
             for file in files:
                 observed = None
@@ -693,24 +690,20 @@ class Studio:
                     if self.inbox_key(file) is None and observed is not None:
                         self.scanned[lang, file] = observed
 
-    @staticmethod
-    def twitch_archive_filename(item):
-        link = re.fullmatch(r"https://www\.twitch\.tv/videos/([0-9]{1,30})", item["url"])
-        return f"twitch-vod-{link[1]}.mp4" if link else None
-
     def twitch_source_health(self, db, recordings):
         handled = {(row["lang"], row["url"]) for row in db.execute("""SELECT lang,url FROM sources
             WHERE rel_file IS NOT NULL OR status NOT IN ('waiting','expired')""")}
         items = [item for item in recordings if (item["lang"], item["url"]) not in handled]
         with_access = 0
         for item in items:
-            filename = self.twitch_archive_filename(item)
+            filename = twitch_media.filename(item)
             local = self.input / item["lang"] / filename if filename else None
             if (local and not local.is_symlink() and local.is_file()) or twitch_media.configured(item):
                 with_access += 1
         active = db.execute("""SELECT count(*) FROM sources
                                WHERE lang='RU' AND status IN ('queued','editing')""").fetchone()[0]
-        return {"archives": len(items), "accessible": with_access, "active": active}
+        archives = sum(item["kind"] == "vod" for item in items)
+        return {"archives": archives, "clips": len(items) - archives, "accessible": with_access, "active": active}
 
     def fetch_twitch_media(self):
         strict = directory_mode() and os.environ.get(twitch_directory.STRICT_RU) == "1"
@@ -725,30 +718,35 @@ class Studio:
                 "SELECT id,lang,url FROM sources WHERE status='waiting' AND rel_file IS NULL AND kind='vod'")}
             handled = {(row["lang"], row["url"]) for row in db.execute(
                 """SELECT lang,url FROM sources
-                   WHERE kind='vod' AND (rel_file IS NOT NULL OR status NOT IN ('waiting','expired'))""")} if strict else set()
+                   WHERE kind IN ('vod','video') AND (rel_file IS NOT NULL OR status NOT IN ('waiting','expired'))""")} if strict else set()
             pending_langs = {row["lang"] for row in db.execute("""SELECT DISTINCT lang FROM sources
                 WHERE rel_file IS NOT NULL AND status='queued' AND auto_plan IS NULL""")}
         for lang, (_, rows) in ranked.items():
             if not automatic_editing(lang) or self.inventory_capacity(counts, lang) <= 0 or lang in pending_langs:
                 continue
             candidates = sorted(rows, key=lambda item: (
-                item.get("directory_priority", float("inf")), item.get("directory_rank", float("inf")), -item["popularity"],
+                item.get("directory_priority", float("inf")), item.get("directory_rank", float("inf")),
+                item["kind"] != "video", -item["popularity"],
                 -datetime.fromisoformat(item["observed"]).timestamp()))
+            attempts = 0
             for item in candidates:
+                if attempts >= TWITCH_MEDIA_ATTEMPTS:
+                    break
                 url = item["url"]
                 registered = (lang, url) in waiting
-                if (item["provider"] != "Twitch" or item["kind"] != "vod" or url in self.media_checks
+                if (item["provider"] != "Twitch" or url in self.media_checks
                         or (strict and lang != "RU")
                         or (strict and (lang, url) in handled)
                         or (not strict and not registered) or not twitch_media.configured(item)):
                     continue
-                filename = self.twitch_archive_filename(item)
+                filename = twitch_media.filename(item)
                 if not filename:
                     continue
                 destination = self.input / lang / filename
                 if destination.exists() or destination.is_symlink():
                     continue
-                self.media_checks[url] = instant + timedelta(minutes=30)
+                attempts += 1
+                self.media_checks[url] = instant + TWITCH_DISCOVERY_INTERVAL
                 try:
                     received = twitch_media.fetch(item, destination, current=instant)
                     detail = "" if received is not None else TWITCH_FILE_PENDING
@@ -756,9 +754,14 @@ class Studio:
                     received = None
                     detail = TWITCH_FILE_ERROR
                 if strict:
-                    if received is None:
+                    if received is None or not destination.is_file() or destination.is_symlink():
                         continue
-                    self.add_source(item, key_override=item["key"], discovered_at=item["observed"])
+                    try:
+                        with self.inbox_lock:
+                            self.add_source(item | {"file": filename}, key_override=item["key"],
+                                            discovered_at=item["observed"])
+                    except (OSError, ValueError):
+                        continue
                 elif registered:
                     with self.db() as db:
                         db.execute("UPDATE sources SET detail=? WHERE id=? AND status='waiting'",
@@ -781,7 +784,7 @@ class Studio:
                 if strict:
                     entries = entries if lang == "RU" else []
                 data = regional.current_candidates((item for item in entries if "directory_rank" in item or
-                    item.get("directory_followup") and item["kind"] == "vod"), instant)
+                    item.get("directory_followup") and item["kind"] in ("vod", "video")), instant)
                 board = []
                 if feeds and datetime.fromisoformat(feeds[0]["checked_at"]) >= instant - timedelta(hours=6):
                     ranked = regional.current_candidates((item for item in entries if "directory_rank" in item), instant)
@@ -814,6 +817,7 @@ class Studio:
         instant = now()
         checked = iso(instant)
         directory = directory_mode()
+        strict = directory and os.environ.get(twitch_directory.STRICT_RU) == "1"
         run_name = "twitch-directory" if directory else "regional"
         retry_name = "twitch-directory-retry"
         with self.db() as db:
@@ -881,24 +885,18 @@ class Studio:
                     items = regional.current_candidates(items, instant)
                 db.execute("INSERT OR REPLACE INTO discovery_feeds VALUES (?,?,?,?)",
                            (lang, provider, checked, json.dumps(items, ensure_ascii=False)))
-            _, _, candidates = self.current_discovery(db, instant)
-            known_keys = {row["source_key"] for row in db.execute(
-                """SELECT source_key FROM sources WHERE status!='dismissed' AND kind='live'
-                   AND COALESCE(last_seen,created)>=?""", (iso(instant - discovery.WINDOW),))}
+            if not strict:
+                _, _, candidates = self.current_discovery(db, instant)
+                known_keys = {row["source_key"] for row in db.execute(
+                    """SELECT source_key FROM sources WHERE status!='dismissed' AND kind='live'
+                       AND COALESCE(last_seen,created)>=?""", (iso(instant - discovery.WINDOW),))}
         saved = 0
-        strict = directory and os.environ.get(twitch_directory.STRICT_RU) == "1"
-        for board, rows in candidates.values():
+        # In RU automatic mode only acquisition or the inbox scanner can register a source.
+        for board, rows in (() if strict else candidates.values()):
             eligible = {item["author"] for item in board}
             per_author = {}
             for row in sorted(rows, key=lambda item: (item["popularity"], item["observed"]), reverse=True):
                 author, key = row["author"], row["key"]
-                if strict:
-                    filename = self.twitch_archive_filename(row)
-                    if row["kind"] != "vod" or not filename:
-                        continue
-                    inbox = self.input / row["lang"] / filename
-                    if not inbox.is_file() or inbox.is_symlink():
-                        continue
                 if not directory and key not in known_keys and (
                         author not in eligible or per_author.get(author, 0) >= 2):
                     continue
